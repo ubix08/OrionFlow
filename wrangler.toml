@@ -12,7 +12,6 @@ directory = "public"
 [[durable_objects.bindings]]
 name = "AGENT"
 class_name = "AdminAgent"
-script_name = "orion-admin-orchestrator"
 
 [[migrations]]
 tag = "v1"
