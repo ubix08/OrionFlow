@@ -1,4 +1,4 @@
-// src/admin-agent.ts - Complete Hub-and-Spoke Orchestrator (UNIFIED)
+// src/admin-agent.ts - Complete Hub-and-Spoke Orchestrator (CORRECTED)
 
 import { DurableObject } from 'cloudflare:workers';
 import type { DurableObjectState } from '@cloudflare/workers-types';
@@ -86,17 +86,34 @@ export class AdminAgent extends DurableObject implements OrionRPC {
   }
 
   // =============================================================
-  // Initialization
+  // Initialization (FIXED)
   // =============================================================
 
   private async init(): Promise<void> {
     if (this.initialized) return;
     
     try {
+      // ✅ ENSURE WORKSPACE IS INITIALIZED IN DURABLE OBJECT CONTEXT
+      if (!Workspace.isInitialized() && this.env.B2_KEY_ID && this.env.B2_APPLICATION_KEY) {
+        console.log('[Admin] Initializing workspace from Durable Object');
+        try {
+          Workspace.initialize(this.env);
+          console.log('[Admin] ✅ Workspace initialized successfully');
+        } catch (e) {
+          console.error('[Admin] ❌ Workspace initialization failed:', e);
+        }
+      }
+      
+      // ✅ VERIFY WORKSPACE BEFORE PROCEEDING
+      if (!Workspace.isInitialized()) {
+        console.warn('[Admin] ⚠️  Workspace not available - workflow features will be disabled');
+      }
+      
       if (this.env.DB) {
         this.d1 = new D1Manager(this.env.DB);
       }
       
+      // ✅ ONLY CREATE WORKFLOW MANAGER IF WORKSPACE IS READY
       if (this.sessionId && Workspace.isInitialized()) {
         this.workflow = new EnhancedWorkflowManager(
           this.env.VECTORIZE || null,
@@ -120,6 +137,8 @@ export class AdminAgent extends DurableObject implements OrionRPC {
         }
 
         await this.storage.setAlarm(Date.now() + 300000);
+      } else if (this.sessionId) {
+        console.warn('[Admin] ⚠️  Workflow features disabled - workspace not initialized');
       }
       
       this.initialized = true;
@@ -209,7 +228,7 @@ export class AdminAgent extends DurableObject implements OrionRPC {
   }
 
   // =============================================================
-  // Conversational Phase
+  // Conversational Phase (FIXED)
   // =============================================================
 
   private async handleConversationalPhase(
@@ -290,7 +309,17 @@ JSON format:
     
     const history = this.formatContextForGemini(this.storage.getMessages().slice(-10));
     const messages = [
-      { role: 'system', content: 'You are ORION, a helpful AI assistant. Be concise and accurate.' },
+      { 
+        role: 'system', 
+        content: `You are ORION, a helpful AI assistant. Be concise and accurate.
+
+IMPORTANT CONSTRAINTS:
+- You do NOT have direct file system access
+- You do NOT have Python code execution for file operations
+- For multi-step projects requiring file management, suggest using structured workflows instead
+- Focus on providing information, analysis, and recommendations
+- If a task requires persistent file storage, explain that it needs a proper workflow`
+      },
       ...history,
       { role: 'user', content: message },
     ];
@@ -300,7 +329,7 @@ JSON format:
       {
         temperature: 0.7,
         useSearch: true,
-        useCodeExecution: true,
+        useCodeExecution: false,  // ✅ DISABLED - prevents hallucinations
         thinkingConfig: { thinkingBudget: 4096 },
         maxOutputTokens: 4096,
         images,
@@ -318,58 +347,103 @@ JSON format:
         turnsUsed: 1,
         toolsUsed: [
           response.searchResults ? 'google_search' : null,
-          response.codeExecutionResults ? 'code_execution' : null,
         ].filter(Boolean) as string[],
       },
     };
   }
 
   private async initiateComplexPlanning(message: string): Promise<ChatResponse> {
-    if (!this.taskPlanner) {
-      throw new Error('Task planner not initialized');
+    // ✅ CHECK IF WORKFLOW FEATURES ARE AVAILABLE
+    if (!this.taskPlanner || !this.workflow || !Workspace.isInitialized()) {
+      await this.saveMessage('user', message);
+      const response = `I understand you need help with: "${message}"
+
+However, the workflow management system is not available right now. This could be because:
+- Workspace (B2 storage) is not configured
+- Workflow templates haven't been bootstrapped
+
+**What I can do:**
+1. Provide information and guidance conversationally
+2. Break down the task into steps you can execute manually
+3. Help with individual components of your project
+
+**To enable full workflow features:**
+- Ensure B2 credentials are configured
+- Run: POST /api/admin/bootstrap to create workflow templates
+- Restart the conversation
+
+Would you like me to help you with this conversationally instead?`;
+      
+      await this.saveMessage('model', response);
+      return {
+        response,
+        artifacts: [],
+        conversationPhase: 'discovery',
+        metadata: { turnsUsed: 1, toolsUsed: [] },
+      };
     }
 
     console.log('[Admin] Initiating planning');
     await this.saveMessage('user', message);
     
-    const plannerResult = await this.taskPlanner.createWorkflowPlan(message);
-    const planId = `plan_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-    
-    if (plannerResult.plan) {
-      this.adminState.mode = 'planning';
-      this.adminState.pendingPlan = plannerResult.plan;
-      this.adminState.pendingPlanId = planId;
-      await this.saveAdminState();
+    try {
+      const plannerResult = await this.taskPlanner.createWorkflowPlan(message);
+      const planId = `plan_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
       
-      const markdown = await this.taskPlanner.formatPlanForUser(plannerResult.plan);
-      const response = `${markdown}\n\n---\n\n✅ **Approve this plan?** Reply "yes" to proceed, or provide feedback.`;
+      if (plannerResult.plan) {
+        this.adminState.mode = 'planning';
+        this.adminState.pendingPlan = plannerResult.plan;
+        this.adminState.pendingPlanId = planId;
+        await this.saveAdminState();
+        
+        const markdown = await this.taskPlanner.formatPlanForUser(plannerResult.plan);
+        const response = `${markdown}\n\n---\n\n✅ **Approve this plan?** Reply "yes" to proceed, or provide feedback.`;
+        
+        await this.saveMessage('model', response);
+        
+        return {
+          response,
+          artifacts: [],
+          conversationPhase: 'discovery',
+          suggestedWorkflows: plannerResult.recommendedWorkflows,
+          metadata: {
+            turnsUsed: 1,
+            toolsUsed: ['task_planner'],
+          },
+        };
+      } else {
+        const markdown = await this.taskPlanner.formatSimpleRecommendation(
+          plannerResult.analysis,
+          plannerResult.recommendedWorkflows
+        );
+        
+        await this.saveMessage('model', markdown);
+        
+        return {
+          response: markdown,
+          artifacts: [],
+          conversationPhase: 'discovery',
+          suggestedWorkflows: plannerResult.recommendedWorkflows,
+          metadata: { turnsUsed: 1, toolsUsed: ['task_planner'] },
+        };
+      }
+    } catch (error) {
+      const errorMsg = error instanceof Error ? error.message : String(error);
+      const response = `I encountered an error while creating the workflow plan: ${errorMsg}
+
+This might be because:
+- Workflow templates haven't been created yet (run: POST /api/admin/bootstrap)
+- Agent definitions are missing
+- B2 workspace is not accessible
+
+Would you like me to help you with this task conversationally instead?`;
       
       await this.saveMessage('model', response);
-      
       return {
         response,
         artifacts: [],
         conversationPhase: 'discovery',
-        suggestedWorkflows: plannerResult.recommendedWorkflows,
-        metadata: {
-          turnsUsed: 1,
-          toolsUsed: ['task_planner'],
-        },
-      };
-    } else {
-      const markdown = await this.taskPlanner.formatSimpleRecommendation(
-        plannerResult.analysis,
-        plannerResult.recommendedWorkflows
-      );
-      
-      await this.saveMessage('model', markdown);
-      
-      return {
-        response: markdown,
-        artifacts: [],
-        conversationPhase: 'discovery',
-        suggestedWorkflows: plannerResult.recommendedWorkflows,
-        metadata: { turnsUsed: 1, toolsUsed: ['task_planner'] },
+        metadata: { turnsUsed: 1, toolsUsed: [] },
       };
     }
   }
@@ -435,17 +509,30 @@ JSON format:
 
   private async executePendingPlan(): Promise<ChatResponse> {
     if (!this.adminState.pendingPlan || !this.workflow) {
-      throw new Error('No pending plan');
+      throw new Error('No pending plan or workflow manager not initialized');
     }
 
     console.log('[Admin] Executing approved plan');
     const plan = this.adminState.pendingPlan;
     
     try {
+      // ✅ VERIFY WORKSPACE IS READY
+      if (!Workspace.isInitialized()) {
+        throw new Error('Workspace not initialized - cannot create project');
+      }
+
       const project = await this.workflow.createProjectFromTemplate(
         plan.workflowId,
         plan.workflowTitle
       );
+      
+      // ✅ VERIFY PROJECT WAS CREATED
+      const projectExists = await Workspace.exists(project.projectPath);
+      if (!projectExists) {
+        throw new Error(`Project creation failed - directory not found: ${project.projectPath}`);
+      }
+      
+      console.log(`[Admin] ✅ Project created and verified: ${project.projectId}`);
       
       this.adminState.mode = 'executing';
       this.adminState.activeProject = {
@@ -465,12 +552,30 @@ JSON format:
         projectPath: project.projectPath,
       });
       
+      const response = `✅ **Project Created Successfully!**
+
+**Project ID**: \`${project.projectId}\`
+**Location**: \`${project.projectPath}\`
+
+Starting execution of Step 1...`;
+      
+      await this.saveMessage('model', response);
+      
+      // Start executing first step
       return await this.executeCurrentStep();
     } catch (error) {
       this.adminState.mode = 'conversational';
       await this.saveAdminState();
       
-      const errorMsg = `Failed to create project: ${error instanceof Error ? error.message : String(error)}`;
+      const errorMsg = `Failed to create project: ${error instanceof Error ? error.message : String(error)}
+
+This might be because:
+- Workflow templates don't exist (run: POST /api/admin/bootstrap)
+- B2 workspace is not accessible
+- Agent definitions are missing
+
+Would you like me to help you with this task conversationally instead?`;
+      
       await this.saveMessage('model', errorMsg);
       
       return {
@@ -483,7 +588,7 @@ JSON format:
   }
 
   // =============================================================
-  // Execution Phase
+  // Execution Phase (IMPROVED)
   // =============================================================
 
   private async handleExecutionPhase(message: string): Promise<ChatResponse> {
@@ -519,6 +624,8 @@ JSON format:
     });
     
     try {
+      await this.workflow.updateStepStatus(projectPath, currentStep, 'in_progress');
+      
       const stepResult = await this.workflow.executeStepWithAgent(
         projectPath, 
         currentStep,
@@ -589,6 +696,7 @@ JSON format:
             nextStepReady: true,
           });
           
+          // Continue to next step
           return await this.executeCurrentStep();
         } else {
           return await this.completeWorkflow();
@@ -684,7 +792,7 @@ JSON format:
     this.adminState.checkpointData = undefined;
     await this.saveAdminState();
     
-    const response = `🎉 **Workflow Complete!**\n\n**Progress**: ${progress?.completed}/${progress?.total} steps\n**Project**: \`${projectPath}\`\n\nAll deliverables saved. What's next?`;
+    const response = `🎉 **Workflow Complete!**\n\n**Progress**: ${progress?.completed}/${progress?.total} steps\n**Project**: \`${projectPath}\`\n\nAll deliverables saved to B2. What's next?`;
     await this.saveMessage('model', response);
     
     this.broadcastWS({
@@ -1055,7 +1163,7 @@ JSON format:
         } as any,
         nativeTools: { 
           googleSearch: true, 
-          codeExecution: true, 
+          codeExecution: false,  // ✅ Disabled to prevent hallucinations
           thinking: true 
         },
         memory: null,
