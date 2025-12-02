@@ -5,19 +5,18 @@ compatibility_date = "2025-08-03"
 [assets]
 directory = "public"
 
-# -------------------------------------------------
-# Durable Object binding (required!)
-# -------------------------------------------------
+# =============================================================
+# Durable Objects
+# =============================================================
+
 [[durable_objects.bindings]]
 name = "AGENT"
-class_name = "OrionAgent"
+class_name = "AdminAgent"
+script_name = "orion-admin-orchestrator"
 
-# -------------------------------------------------
-# Tell Cloudflare that the class exists in the bundle
-# -------------------------------------------------
 [[migrations]]
 tag = "v1"
-new_sqlite_classes = ["OrionAgent"]
+new_classes = ["AdminAgent"]
 
 # Increased CPU limit for complex agent operations (5 minutes)
 [durable_objects.limits]
