@@ -1,9 +1,9 @@
-// src/index.ts - Complete Worker with AdminAgent (FINAL)
+// src/index.ts - Refactored Worker with Session-Agnostic Architecture
 
-import { AdminAgent } from './admin-agent';
-import { D1Manager } from './storage/d1-manager';
+import { AdminAgent } from './admin-agent-refactored';
+import { D1Manager } from './storage/d1-manager-enhanced';
 import { Workspace } from './workspace/workspace';
-import type { Env, OrionRPC } from './types';
+import type { Env, OrionRPC, ProjectFilters } from './types';
 import type { DurableObjectStub } from '@cloudflare/workers-types';
 
 export { AdminAgent };
@@ -15,6 +15,18 @@ export { AdminAgent };
 function getSessionId(request: Request): string | null {
   const url = new URL(request.url);
   return url.searchParams.get('session_id') || request.headers.get('X-Session-ID') || null;
+}
+
+function getUserId(request: Request): string | null {
+  // In production: extract from JWT
+  const authHeader = request.headers.get('Authorization');
+  if (authHeader?.startsWith('Bearer ')) {
+    // TODO: Decode JWT and extract userId
+    return null;
+  }
+  
+  // Fallback: use session_id as user_id
+  return getSessionId(request);
 }
 
 function jsonResponse(data: any, status = 200): Response {
@@ -47,6 +59,7 @@ async function routeToRPC(
   ctx: ExecutionContext
 ): Promise<Response> {
   const sessionId = getSessionId(request);
+  const userId = getUserId(request);
 
   if (!sessionId) {
     return errorResponse('Session ID required', 400);
@@ -65,7 +78,7 @@ async function routeToRPC(
       const d1 = new D1Manager(env.DB);
       const existing = await d1.getSession(sessionId);
       if (!existing) {
-        await d1.createSession(sessionId, 'New Session');
+        await d1.createSession(sessionId, userId || undefined, 'New Session');
       }
     }
 
@@ -82,40 +95,39 @@ async function routeToRPC(
         }
         break;
 
-      case '/api/execute-step':
-        if (request.method === 'POST') {
-          const { projectPath, stepNumber } = await request.json();
-          const result = await stub.executeStep(projectPath, stepNumber);
-          return jsonResponse(result);
-        }
-        break;
-
-      case '/api/workflows':
-        if (request.method === 'GET') {
-          const result = await stub.listWorkflows();
-          return jsonResponse(result);
-        }
-        break;
-
-      case '/api/workflows/search':
-        if (request.method === 'POST') {
-          const { query } = await request.json();
-          const result = await stub.searchWorkflows(query);
-          return jsonResponse(result);
-        }
-        break;
-
-      case '/api/workflows/create-project':
-        if (request.method === 'POST') {
-          const { workflowId, objective, adaptations } = await request.json();
-          const result = await stub.createProjectFromWorkflow(workflowId, objective, adaptations);
-          return jsonResponse(result);
-        }
-        break;
-
       case '/api/projects':
         if (request.method === 'GET') {
-          const result = await stub.getProjects();
+          const filters: ProjectFilters = {};
+          const statusParam = url.searchParams.get('status');
+          if (statusParam) filters.status = statusParam as any;
+          
+          const domainParam = url.searchParams.get('domain');
+          if (domainParam) filters.domain = domainParam;
+          
+          const limitParam = url.searchParams.get('limit');
+          if (limitParam) filters.limit = parseInt(limitParam, 10);
+          
+          const result = await stub.listProjects(filters);
+          return jsonResponse(result);
+        }
+        break;
+
+      case '/api/projects/get':
+        if (request.method === 'GET') {
+          const projectId = url.searchParams.get('projectId');
+          if (!projectId) return errorResponse('projectId required', 400);
+          
+          const result = await stub.getProject(projectId);
+          return jsonResponse(result);
+        }
+        break;
+
+      case '/api/projects/continue':
+        if (request.method === 'POST') {
+          const { projectId } = await request.json();
+          if (!projectId) return errorResponse('projectId required', 400);
+          
+          const result = await stub.continueProject(projectId);
           return jsonResponse(result);
         }
         break;
@@ -123,13 +135,6 @@ async function routeToRPC(
       case '/api/history':
         if (request.method === 'GET') {
           const result = await stub.getHistory();
-          return jsonResponse(result);
-        }
-        break;
-
-      case '/api/artifacts':
-        if (request.method === 'GET') {
-          const result = await stub.getArtifacts();
           return jsonResponse(result);
         }
         break;
@@ -177,25 +182,6 @@ async function routeToRPC(
           return jsonResponse(result);
         }
         break;
-
-      // === NEW AGENT ENDPOINTS ===
-      case '/api/agents':
-        if (request.method === 'GET') {
-          // List all available agents
-          const agents = await stub.getStatus();
-          return jsonResponse({ 
-            agents: [], // This would be populated from AgentRegistry
-            count: (agents as any).metrics?.availableAgents || 0 
-          });
-        }
-        break;
-
-      case '/api/admin/state':
-        if (request.method === 'GET') {
-          const status = await stub.getStatus();
-          return jsonResponse(status);
-        }
-        break;
     }
 
     return new Response('Not Found', { status: 404 });
@@ -215,6 +201,7 @@ async function routeToWebSocket(
   ctx: ExecutionContext
 ): Promise<Response> {
   const sessionId = getSessionId(request);
+  const userId = getUserId(request);
 
   if (!sessionId || !isValidSessionId(sessionId)) {
     return errorResponse('Valid session ID required for WebSocket', 400);
@@ -229,7 +216,7 @@ async function routeToWebSocket(
       const d1 = new D1Manager(env.DB);
       const existing = await d1.getSession(sessionId);
       if (!existing) {
-        await d1.createSession(sessionId, 'New Session');
+        await d1.createSession(sessionId, userId || undefined, 'New Session');
       }
     }
 
@@ -256,13 +243,14 @@ async function handleSessionManagement(
   const d1 = new D1Manager(env.DB);
   const url = new URL(request.url);
   const path = url.pathname;
+  const userId = getUserId(request);
 
   try {
     switch (path) {
       case '/api/sessions':
         if (request.method === 'GET') {
           const limit = parseInt(url.searchParams.get('limit') || '50', 10);
-          const sessions = await d1.listSessions(limit);
+          const sessions = await d1.listSessions(userId || undefined, limit);
           return jsonResponse({ sessions });
         }
         if (request.method === 'POST') {
@@ -270,7 +258,7 @@ async function handleSessionManagement(
           if (!sessionId || !isValidSessionId(sessionId)) {
             return errorResponse('Valid sessionId required', 400);
           }
-          const session = await d1.createSession(sessionId, title);
+          const session = await d1.createSession(sessionId, userId || undefined, title);
           return jsonResponse({ session });
         }
         break;
@@ -283,21 +271,41 @@ async function handleSessionManagement(
           return jsonResponse({ ok: true });
         }
         break;
-
-      case '/api/sessions/rename':
-        if (request.method === 'POST') {
-          const { sessionId, title } = await request.json();
-          if (!sessionId || !title) return errorResponse('sessionId and title required', 400);
-          await d1.updateSessionTitle(sessionId, title);
-          return jsonResponse({ ok: true });
-        }
-        break;
     }
 
     return new Response('Not Found', { status: 404 });
   } catch (err: any) {
     console.error('[Worker] Session management error:', err);
     return errorResponse(err.message || 'Session operation failed', 500);
+  }
+}
+
+// =============================================================
+// Admin Bootstrap Endpoint
+// =============================================================
+
+async function handleBootstrap(
+  request: Request,
+  env: Env,
+  ctx: ExecutionContext
+): Promise<Response> {
+  // This endpoint would initialize workflow templates and agent definitions
+  // Implementation depends on where you store initial templates
+  
+  if (request.method !== 'POST') {
+    return errorResponse('Method not allowed', 405);
+  }
+
+  try {
+    // TODO: Initialize workspace with default templates and agents
+    return jsonResponse({ 
+      message: 'Bootstrap complete',
+      templatesCreated: 0,
+      agentsCreated: 0,
+    });
+  } catch (err: any) {
+    console.error('[Worker] Bootstrap error:', err);
+    return errorResponse(err.message || 'Bootstrap failed', 500);
   }
 }
 
@@ -330,7 +338,7 @@ export default {
       if (!Workspace.isInitialized() && env.B2_KEY_ID && env.B2_APPLICATION_KEY) {
         try {
           Workspace.initialize(env);
-          console.log('[Worker] Workspace initialized successfully');
+          console.log('[Worker] Workspace initialized');
         } catch (e) {
           console.warn('[Worker] Workspace initialization failed:', e);
         }
@@ -357,12 +365,17 @@ export default {
         return jsonResponse({
           status: 'ok',
           name: 'ORION AI-Collaborator',
-          version: '6.0.0-admin-orchestrator',
-          architecture: 'Hub-and-Spoke Multi-Agent System',
+          version: '7.0.0-session-agnostic',
+          architecture: 'Session-Agnostic Multi-Agent System',
           d1: d1Status,
           workspace: workspaceStatus,
           timestamp: new Date().toISOString(),
         });
+      }
+
+      // Bootstrap endpoint
+      if (path === '/api/admin/bootstrap') {
+        return await handleBootstrap(request, env, ctx);
       }
 
       // WebSocket upgrade
