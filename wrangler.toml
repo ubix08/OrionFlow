@@ -16,7 +16,7 @@ script_name = "orion-admin-orchestrator"
 
 [[migrations]]
 tag = "v1"
-new_classes = ["AdminAgent"]
+new_sqlite_classes = ["AdminAgent"]
 
 # Increased CPU limit for complex agent operations (5 minutes)
 [durable_objects.limits]
