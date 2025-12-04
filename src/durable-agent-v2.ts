@@ -30,7 +30,7 @@ import type { ToolResult } from './tools-v2/tool-types';
  * - Worker Agents: Execution via native tools
  * - Clear separation of concerns
  */
-export class OrionAgentV2 extends DurableObject implements OrionRPC {
+export class OrionAgent extends DurableObject implements OrionRPC {
   private state: DurableObjectState;
   private storage: DurableStorage;
   private gemini: GeminiClient;
@@ -565,4 +565,4 @@ export class OrionAgentV2 extends DurableObject implements OrionRPC {
   }
 }
 
-export default OrionAgentV2;
+export default OrionAgent;
