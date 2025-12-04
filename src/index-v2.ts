@@ -1,12 +1,11 @@
 // src/index-v2.ts - Worker Entry Point with Feature Flag
 
 import { OrionAgent } from './durable-agent';
-import { OrionAgentV2 } from './durable-agent-v2';
 import { D1Manager } from './storage/d1-manager';
 import type { Env, OrionRPC } from './types';
 import type { DurableObjectStub } from '@cloudflare/workers-types';
 
-export { OrionAgent, OrionAgentV2 };
+export { OrionAgent };
 
 // =============================================================
 // Helper Functions
