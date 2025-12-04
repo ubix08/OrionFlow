@@ -11,11 +11,11 @@ directory = "public"
 
 [[durable_objects.bindings]]
 name = "AGENT"
-class_name = "AdminAgent"
+class_name = "OrionAgentV2"
 
 [[migrations]]
 tag = "v1"
-new_sqlite_classes = ["AdminAgent"]
+new_sqlite_classes = ["OrionAgentV2"]
 
 # Increased CPU limit for complex agent operations (5 minutes)
 [durable_objects.limits]
