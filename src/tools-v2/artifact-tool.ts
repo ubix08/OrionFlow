@@ -1,6 +1,6 @@
-// src/tools-v2/artifact-tool.ts - Artifact Lifecycle Management (FIXED)
+// src/tools-v2/artifact-tool.ts - FIXED: Use Workspace singleton
 
-import type { WorkspaceImpl } from '../workspace/workspace';
+import { Workspace } from '../workspace/workspace';
 import type {
   AdminTool,
   ToolResult,
@@ -11,13 +11,12 @@ import type {
  * Artifact Tool - Manages artifacts in B2 workspace (FIXED)
  * 
  * FIXES APPLIED:
- * ✅ Dependency injection instead of singleton
- * ✅ Proper workspace availability checks
- * ✅ Better error messages
- * ✅ Transaction safety (cleanup on failure)
+ * ✅ Removed workspace constructor parameter
+ * ✅ Uses Workspace singleton directly
+ * ✅ Better error messages with workspace status checks
  */
 export class ArtifactTool implements AdminTool {
-  constructor(private workspace: WorkspaceImpl | null) {}
+  // No constructor needed - uses Workspace singleton
 
   getDeclaration(): FunctionDeclaration {
     return {
@@ -60,8 +59,8 @@ export class ArtifactTool implements AdminTool {
     content?: string;
     mimeType?: string;
   }): Promise<ToolResult> {
-    // Check workspace availability
-    if (!this.workspace) {
+    // Check workspace availability using singleton
+    if (!Workspace.isInitialized()) {
       return {
         success: false,
         data: null,
@@ -113,8 +112,8 @@ export class ArtifactTool implements AdminTool {
       };
     }
 
-    // Find task folder
-    const tasksDir = await this.workspace!.ls('tasks');
+    // Find task folder using Workspace singleton
+    const tasksDir = await Workspace.readdir('tasks');
     const taskFolder = tasksDir.directories.find(d => d.includes(args.taskId));
 
     if (!taskFolder) {
@@ -129,8 +128,8 @@ export class ArtifactTool implements AdminTool {
     const artifactPath = `tasks/${taskFolder}/artifacts/${args.filename}`;
     const mimeType = args.mimeType || this.inferMimeType(args.filename);
 
-    // Write artifact
-    const { etag } = await this.workspace!.write(artifactPath, args.content, { mimeType });
+    // Write artifact using Workspace singleton
+    await Workspace.writeFile(artifactPath, args.content, mimeType);
 
     console.log(`[ArtifactTool] ✅ Wrote artifact: ${args.filename} (${args.content.length} bytes)`);
 
@@ -141,8 +140,7 @@ export class ArtifactTool implements AdminTool {
         filename: args.filename,
         path: artifactPath,
         size: args.content.length,
-        mimeType,
-        etag
+        mimeType
       },
       summary: `Wrote artifact: ${args.filename} (${args.content.length} bytes)`,
       metadata: {
@@ -168,8 +166,7 @@ export class ArtifactTool implements AdminTool {
       };
     }
 
-    // Find task folder
-    const tasksDir = await this.workspace!.ls('tasks');
+    const tasksDir = await Workspace.readdir('tasks');
     const taskFolder = tasksDir.directories.find(d => d.includes(args.taskId));
 
     if (!taskFolder) {
@@ -183,8 +180,8 @@ export class ArtifactTool implements AdminTool {
 
     const artifactPath = `tasks/${taskFolder}/artifacts/${args.filename}`;
 
-    // Check if artifact exists
-    const exists = await this.workspace!.exists(artifactPath);
+    // Check if artifact exists using Workspace singleton
+    const exists = await Workspace.exists(artifactPath);
     if (!exists) {
       return {
         success: false,
@@ -194,8 +191,8 @@ export class ArtifactTool implements AdminTool {
       };
     }
 
-    // Read artifact
-    const { content, etag } = await this.workspace!.read(artifactPath);
+    // Read artifact using Workspace singleton
+    const content = await Workspace.readFileText(artifactPath);
 
     console.log(`[ArtifactTool] ✅ Read artifact: ${args.filename} (${content.length} bytes)`);
 
@@ -205,8 +202,7 @@ export class ArtifactTool implements AdminTool {
         taskId: args.taskId,
         filename: args.filename,
         content,
-        size: content.length,
-        etag
+        size: content.length
       },
       summary: `Read artifact: ${args.filename} (${content.length} bytes)`,
       metadata: {
@@ -223,8 +219,7 @@ export class ArtifactTool implements AdminTool {
   private async listArtifacts(args: {
     taskId: string;
   }): Promise<ToolResult> {
-    // Find task folder
-    const tasksDir = await this.workspace!.ls('tasks');
+    const tasksDir = await Workspace.readdir('tasks');
     const taskFolder = tasksDir.directories.find(d => d.includes(args.taskId));
 
     if (!taskFolder) {
@@ -238,14 +233,13 @@ export class ArtifactTool implements AdminTool {
 
     const artifactsPath = `tasks/${taskFolder}/artifacts`;
 
-    // List artifacts
-    const listing = await this.workspace!.ls(artifactsPath);
+    // List artifacts using Workspace singleton
+    const listing = await Workspace.readdir(artifactsPath);
 
     const artifacts = listing.files.map(f => ({
       name: f.name,
       size: f.size,
-      modified: f.modified,
-      etag: f.etag
+      modified: f.modified
     }));
 
     console.log(`[ArtifactTool] ✅ Listed ${artifacts.length} artifacts`);
@@ -277,8 +271,7 @@ export class ArtifactTool implements AdminTool {
       };
     }
 
-    // Find task folder
-    const tasksDir = await this.workspace!.ls('tasks');
+    const tasksDir = await Workspace.readdir('tasks');
     const taskFolder = tasksDir.directories.find(d => d.includes(args.taskId));
 
     if (!taskFolder) {
@@ -293,7 +286,7 @@ export class ArtifactTool implements AdminTool {
     const artifactPath = `tasks/${taskFolder}/artifacts/${args.filename}`;
 
     // Check if artifact exists
-    const exists = await this.workspace!.exists(artifactPath);
+    const exists = await Workspace.exists(artifactPath);
     if (!exists) {
       return {
         success: false,
@@ -303,8 +296,8 @@ export class ArtifactTool implements AdminTool {
       };
     }
 
-    // Delete artifact
-    await this.workspace!.unlink(artifactPath);
+    // Delete artifact using Workspace singleton
+    await Workspace.unlink(artifactPath);
 
     console.log(`[ArtifactTool] ✅ Deleted artifact: ${args.filename}`);
 
@@ -362,7 +355,6 @@ export class ArtifactTool implements AdminTool {
     
     const errorMessage = error instanceof Error ? error.message : String(error);
     
-    // Provide helpful error messages
     if (errorMessage.includes('403') || errorMessage.includes('PERMISSION_DENIED')) {
       return {
         success: false,
