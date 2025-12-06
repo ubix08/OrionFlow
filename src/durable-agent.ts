@@ -125,15 +125,43 @@ export class OrionAgent extends DurableObject implements OrionRPC {
     if (workspaceConfigured) {
       try {
         console.log('[AgentV2] Initializing B2 Workspace...');
-        console.log('[AgentV2] B2 Config:', {
+        console.log('[AgentV2] B2 Environment Check:', {
           hasKeyId: !!this.env.B2_KEY_ID,
           hasAppKey: !!this.env.B2_APPLICATION_KEY,
-          endpoint: this.env.B2_S3_ENDPOINT,
-          bucket: this.env.B2_BUCKET,
-          basePath: this.env.B2_BASE_PATH || '(none)'
+          hasEndpoint: !!this.env.B2_S3_ENDPOINT,
+          hasBucket: !!this.env.B2_BUCKET,
+          hasBasePath: !!this.env.B2_BASE_PATH,
+          // Log sanitized values for debugging
+          keyIdPreview: this.env.B2_KEY_ID ? 
+            `${String(this.env.B2_KEY_ID).substring(0, 8)}...` : 'MISSING',
+          endpointValue: this.env.B2_S3_ENDPOINT || 'MISSING',
+          endpointFormat: this.env.B2_S3_ENDPOINT ? 
+            (String(this.env.B2_S3_ENDPOINT).startsWith('http') ? 'valid (has protocol)' : 'INVALID (missing http/https)') : 
+            'MISSING',
+          bucketValue: this.env.B2_BUCKET || 'MISSING',
+          basePathValue: this.env.B2_BASE_PATH || '(none - using root)'
         });
         
+        // Validate endpoint format before initialization
+        const endpoint = String(this.env.B2_S3_ENDPOINT || '');
+        if (!endpoint.startsWith('http://') && !endpoint.startsWith('https://')) {
+          throw new Error(
+            `B2_S3_ENDPOINT missing http:// or https:// prefix. ` +
+            `Got: "${endpoint}". ` +
+            `Expected: https://s3.<region>.backblazeb2.com (e.g., https://s3.us-west-004.backblazeb2.com)`
+          );
+        }
+        
+        if (!endpoint.includes('.backblazeb2.com')) {
+          throw new Error(
+            `B2_S3_ENDPOINT does not appear to be a valid Backblaze endpoint. ` +
+            `Got: "${endpoint}". ` +
+            `Expected format: https://s3.<region>.backblazeb2.com`
+          );
+        }
+        
         // Initialize workspace singleton
+        console.log('[AgentV2] Calling Workspace.initialize()...');
         Workspace.initialize(this.env);
         
         // Verify initialization succeeded
@@ -146,42 +174,62 @@ export class OrionAgent extends DurableObject implements OrionRPC {
             const config = Workspace.getConfig();
             console.log('[AgentV2] Workspace config:', {
               endpoint: config.endpoint,
+              region: config.region,
               bucket: config.bucket,
-              basePath: config.basePath
+              basePath: config.basePath || '(root)'
             });
             
-            // Create tasks directory if it doesn't exist
+            // Check if tasks directory exists
+            console.log('[AgentV2] Checking tasks directory existence...');
             const tasksExists = await Workspace.exists('tasks');
+            console.log('[AgentV2] Tasks directory check result:', tasksExists);
+            
             if (!tasksExists) {
+              console.log('[AgentV2] Creating tasks directory...');
               await Workspace.mkdir('tasks');
-              console.log('[AgentV2] Created tasks directory');
+              console.log('[AgentV2] ✅ Created tasks directory');
             } else {
-              console.log('[AgentV2] Tasks directory already exists');
+              console.log('[AgentV2] ✅ Tasks directory already exists');
             }
+            
+            // Verify we can list the directory
+            const listing = await Workspace.readdir('tasks');
+            console.log('[AgentV2] ✅ Tasks directory verified:', {
+              directories: listing.directories.length,
+              files: listing.files.length
+            });
+            
           } catch (testError) {
             console.error('[AgentV2] ⚠️  Workspace test failed:', testError);
+            console.error('[AgentV2] Error details:', {
+              name: testError instanceof Error ? testError.name : 'Unknown',
+              message: testError instanceof Error ? testError.message : String(testError),
+              stack: testError instanceof Error ? testError.stack?.split('\n').slice(0, 5).join('\n') : undefined
+            });
             // Don't throw - allow system to continue with workspace disabled
             this.workspaceEnabled = false;
           }
         } else {
-          console.error('[AgentV2] ❌ Workspace.isInitialized() returned false');
+          console.error('[AgentV2] ❌ Workspace.isInitialized() returned false after initialization');
           this.workspaceEnabled = false;
         }
       } catch (error) {
         console.error('[AgentV2] ❌ B2 Workspace initialization failed:', error);
         console.error('[AgentV2] Error details:', {
+          name: error instanceof Error ? error.name : 'Unknown',
           message: error instanceof Error ? error.message : String(error),
-          stack: error instanceof Error ? error.stack : undefined
+          stack: error instanceof Error ? error.stack?.split('\n').slice(0, 10).join('\n') : undefined
         });
         this.workspaceEnabled = false;
       }
     } else {
-      console.warn('[AgentV2] ⚠️  B2 Workspace not configured');
-      console.warn('[AgentV2] Missing environment variables. Required:');
-      console.warn('  - B2_KEY_ID:', this.env.B2_KEY_ID ? 'SET' : 'MISSING');
-      console.warn('  - B2_APPLICATION_KEY:', this.env.B2_APPLICATION_KEY ? 'SET' : 'MISSING');
-      console.warn('  - B2_S3_ENDPOINT:', this.env.B2_S3_ENDPOINT ? 'SET' : 'MISSING');
-      console.warn('  - B2_BUCKET:', this.env.B2_BUCKET ? 'SET' : 'MISSING');
+      console.warn('[AgentV2] ⚠️  B2 Workspace not configured - missing required environment variables');
+      console.warn('[AgentV2] Required variables:');
+      console.warn('  - B2_KEY_ID:', this.env.B2_KEY_ID ? '✓ SET' : '✗ MISSING');
+      console.warn('  - B2_APPLICATION_KEY:', this.env.B2_APPLICATION_KEY ? '✓ SET' : '✗ MISSING');
+      console.warn('  - B2_S3_ENDPOINT:', this.env.B2_S3_ENDPOINT ? '✓ SET' : '✗ MISSING');
+      console.warn('  - B2_BUCKET:', this.env.B2_BUCKET ? '✓ SET' : '✗ MISSING');
+      console.warn('  - B2_BASE_PATH:', this.env.B2_BASE_PATH ? '✓ SET (optional)' : '(optional - not set)');
       this.workspaceEnabled = false;
     }
     
@@ -756,7 +804,7 @@ Present final results and prepare for next task.
     }
     return '';
   }
-
+  
   private async saveMessage(role: 'user' | 'model', content: string): Promise<void> {
     await this.storage.saveMessage(role, [{ text: content }], Date.now());
   }
@@ -787,4 +835,34 @@ Present final results and prepare for next task.
   }
 }
 
+export default OrionAgent;], Date.now());
+  }
+
+  private async syncToD1(): Promise<void> {
+    if (!this.d1 || !this.sessionId) return;
+    
+    try {
+      const messages = this.storage.getMessages();
+      if (messages.length === 0) return;
+      
+      const latestInD1 = await this.d1.getLatestMessageTimestamp(this.sessionId);
+      const newMessages = messages.filter(m => (m.timestamp || 0) > latestInD1);
+      
+      if (newMessages.length > 0) {
+        await this.d1.saveMessages(this.sessionId, newMessages);
+        console.log(`[AgentV2] ✅ Synced ${newMessages.length} messages to D1`);
+      }
+      
+      const artifacts = this.storage.getArtifacts();
+      for (const artifact of artifacts) {
+        await this.d1.saveArtifact(this.sessionId, artifact);
+      }
+    } catch (err) {
+      console.error('[AgentV2] D1 sync failed:', err);
+      throw err;
+    }
+  }
+}
+
 export default OrionAgent;
+    
