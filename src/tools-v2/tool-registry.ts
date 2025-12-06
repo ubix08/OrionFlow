@@ -1,4 +1,4 @@
-// src/tools-v2/tool-registry.ts - Central Admin Tool Registry
+// src/tools-v2/tool-registry.ts - Enhanced Admin Tool Registry
 
 import type { GeminiClient } from '../gemini';
 import type { MemoryManager } from '../memory/memory-manager';
@@ -11,6 +11,9 @@ import {
   DelegateTool,
   AskUserTool
 } from './admin-tools';
+import { RAGSearchTool } from './rag-search-tool';
+import { PlannedTasksTool } from './planned-tasks-tool';
+import { ArtifactTool } from './artifact-tool';
 
 /**
  * Central registry for all admin tools
@@ -41,6 +44,15 @@ export class AdminToolRegistry {
     
     this.tools.set('search_knowledge', new KnowledgeSearchTool(gemini));
     
+    // Enhanced RAG search across multiple sources
+    this.tools.set('rag_search', new RAGSearchTool(gemini, memory));
+    
+    // Task management system
+    this.tools.set('planned_tasks', new PlannedTasksTool());
+    
+    // Artifact lifecycle management
+    this.tools.set('artifact_tool', new ArtifactTool());
+    
     // Worker delegation
     this.tools.set('delegate_to_worker', new DelegateTool(workerFactory));
     
@@ -59,6 +71,7 @@ export class AdminToolRegistry {
   
   /**
    * Execute a tool by name with arguments
+   * Returns structured ToolResult with typed data
    */
   async executeTool(name: string, args: any): Promise<ToolResult> {
     const tool = this.tools.get(name);
@@ -73,7 +86,7 @@ export class AdminToolRegistry {
     }
     
     try {
-      console.log(`[ToolRegistry] Executing ${name} with args:`, args);
+      console.log(`[ToolRegistry] Executing ${name} with args:`, JSON.stringify(args).substring(0, 200));
       const result = await tool.execute(args);
       console.log(`[ToolRegistry] ${name} completed:`, result.success ? 'SUCCESS' : 'FAILED');
       return result;
@@ -107,5 +120,19 @@ export class AdminToolRegistry {
    */
   getToolNames(): string[] {
     return Array.from(this.tools.keys());
+  }
+  
+  /**
+   * Get tool metadata for debugging
+   */
+  getToolMetadata(): Array<{ name: string; description: string; parameters: any }> {
+    return Array.from(this.tools.entries()).map(([name, tool]) => {
+      const declaration = tool.getDeclaration();
+      return {
+        name,
+        description: declaration.description,
+        parameters: declaration.parameters
+      };
+    });
   }
 }
