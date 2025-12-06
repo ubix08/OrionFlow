@@ -394,4 +394,4 @@ export class ArtifactTool implements AdminTool {
     }
     return groups;
   }
-}o
+}
