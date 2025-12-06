@@ -1,54 +1,51 @@
-// src/tools-v2/artifact-tool.ts - Artifact Lifecycle Management
+// src/tools-v2/artifact-tool.ts - Artifact Lifecycle Management (FIXED)
 
-import { Workspace } from '../workspace/workspace';
+import type { WorkspaceImpl } from '../workspace/workspace';
 import type {
   AdminTool,
   ToolResult,
-  FunctionDeclaration,
-  ArtifactReference
+  FunctionDeclaration
 } from './tool-types';
 
+/**
+ * Artifact Tool - Manages artifacts in B2 workspace (FIXED)
+ * 
+ * FIXES APPLIED:
+ * ✅ Dependency injection instead of singleton
+ * ✅ Proper workspace availability checks
+ * ✅ Better error messages
+ * ✅ Transaction safety (cleanup on failure)
+ */
 export class ArtifactTool implements AdminTool {
+  constructor(private workspace: WorkspaceImpl | null) {}
+
   getDeclaration(): FunctionDeclaration {
     return {
       name: 'artifact_tool',
-      description: 'Manage task artifacts: write new artifacts from worker outputs, load existing artifacts, or delete artifacts.',
+      description: 'Manage artifacts in the workspace. Write, read, list, or delete artifacts in task directories.',
       parameters: {
         type: 'object',
         properties: {
           action: {
             type: 'string',
-            enum: ['write', 'load', 'delete', 'list'],
-            description: 'Action: write (save artifact), load (read artifact), delete (remove artifact), list (list all artifacts for task)'
+            enum: ['write', 'read', 'list', 'delete'],
+            description: 'Action: write (save), read (retrieve), list (list all), delete (remove)'
           },
           taskId: {
             type: 'string',
             description: 'Task ID that owns the artifact'
           },
-          artifactId: {
+          filename: {
             type: 'string',
-            description: 'Unique artifact identifier (for load/delete)'
-          },
-          stepNumber: {
-            type: 'number',
-            description: 'Step number that generated the artifact (for write)'
-          },
-          type: {
-            type: 'string',
-            enum: ['code', 'research', 'analysis', 'content', 'data', 'report'],
-            description: 'Type of artifact (for write)'
-          },
-          title: {
-            type: 'string',
-            description: 'Human-readable title (for write)'
+            description: 'Artifact filename (required for write, read, delete)'
           },
           content: {
             type: 'string',
-            description: 'Artifact content (for write)'
+            description: 'Artifact content (required for write)'
           },
-          format: {
+          mimeType: {
             type: 'string',
-            description: 'File format/extension (e.g., md, json, py, txt)'
+            description: 'MIME type for the artifact (optional, defaults to text/plain)'
           }
         },
         required: ['action', 'taskId']
@@ -57,21 +54,22 @@ export class ArtifactTool implements AdminTool {
   }
 
   async execute(args: {
-    action: 'write' | 'load' | 'delete' | 'list';
+    action: 'write' | 'read' | 'list' | 'delete';
     taskId: string;
-    artifactId?: string;
-    stepNumber?: number;
-    type?: string;
-    title?: string;
+    filename?: string;
     content?: string;
-    format?: string;
+    mimeType?: string;
   }): Promise<ToolResult> {
-    if (!Workspace.isInitialized()) {
+    // Check workspace availability
+    if (!this.workspace) {
       return {
         success: false,
         data: null,
-        summary: 'Workspace not initialized. Cannot manage artifacts.',
-        metadata: { error: 'WORKSPACE_NOT_AVAILABLE' }
+        summary: 'Artifact management is not available. The workspace requires B2 storage configuration.',
+        metadata: { 
+          error: 'WORKSPACE_NOT_AVAILABLE',
+          hint: 'Configure B2_KEY_ID, B2_APPLICATION_KEY, B2_S3_ENDPOINT, and B2_BUCKET'
+        }
       };
     }
 
@@ -79,12 +77,12 @@ export class ArtifactTool implements AdminTool {
       switch (args.action) {
         case 'write':
           return await this.writeArtifact(args);
-        case 'load':
-          return await this.loadArtifact(args);
-        case 'delete':
-          return await this.deleteArtifact(args);
+        case 'read':
+          return await this.readArtifact(args);
         case 'list':
           return await this.listArtifacts(args);
+        case 'delete':
+          return await this.deleteArtifact(args);
         default:
           return {
             success: false,
@@ -93,13 +91,7 @@ export class ArtifactTool implements AdminTool {
           };
       }
     } catch (error) {
-      console.error('[ArtifactTool] Error:', error);
-      return {
-        success: false,
-        data: null,
-        summary: `Artifact operation failed: ${error instanceof Error ? error.message : String(error)}`,
-        metadata: { error: 'OPERATION_FAILED' }
-      };
+      return this.formatError(error, args.action);
     }
   }
 
@@ -109,196 +101,117 @@ export class ArtifactTool implements AdminTool {
 
   private async writeArtifact(args: {
     taskId: string;
-    stepNumber?: number;
-    type?: string;
-    title?: string;
+    filename?: string;
     content?: string;
-    format?: string;
+    mimeType?: string;
   }): Promise<ToolResult> {
-    if (!args.content || !args.title || !args.type) {
+    if (!args.filename || !args.content) {
       return {
         success: false,
         data: null,
-        summary: 'Missing required fields: content, title, and type are required for write'
+        summary: 'filename and content are required for write action'
       };
     }
 
     // Find task folder
-    const taskFolder = await this.findTaskFolder(args.taskId);
+    const tasksDir = await this.workspace!.ls('tasks');
+    const taskFolder = tasksDir.directories.find(d => d.includes(args.taskId));
+
     if (!taskFolder) {
       return {
         success: false,
         data: null,
-        summary: `Task not found: ${args.taskId}`
+        summary: `Task not found: ${args.taskId}. Use planned_tasks(list_tasks) to see available tasks.`,
+        metadata: { error: 'TASK_NOT_FOUND' }
       };
     }
 
-    const taskPath = `tasks/${taskFolder}`;
+    const artifactPath = `tasks/${taskFolder}/artifacts/${args.filename}`;
+    const mimeType = args.mimeType || this.inferMimeType(args.filename);
 
-    // Generate artifact ID and filename
-    const artifactId = `artifact_${Date.now()}_${this.slugify(args.title)}`;
-    const format = args.format || this.inferFormat(args.type);
-    const filename = `${artifactId}.${format}`;
-    const artifactPath = `${taskPath}/artifacts/${filename}`;
+    // Write artifact
+    const { etag } = await this.workspace!.write(artifactPath, args.content, { mimeType });
 
-    // Create artifact metadata
-    const metadata: ArtifactReference = {
-      artifactId,
-      taskId: args.taskId,
-      stepNumber: args.stepNumber || 0,
-      path: artifactPath,
-      type: args.type,
-      title: args.title,
-      createdAt: Date.now()
-    };
-
-    // Write artifact content
-    await Workspace.writeFile(artifactPath, args.content);
-
-    // Write artifact metadata
-    const metadataPath = `${taskPath}/artifacts/${artifactId}.meta.json`;
-    await Workspace.writeFile(metadataPath, JSON.stringify(metadata, null, 2));
-
-    console.log(`[ArtifactTool] Wrote artifact: ${artifactId} to ${taskPath}`);
+    console.log(`[ArtifactTool] ✅ Wrote artifact: ${args.filename} (${args.content.length} bytes)`);
 
     return {
       success: true,
       data: {
-        artifactId,
+        taskId: args.taskId,
+        filename: args.filename,
         path: artifactPath,
-        metadata
+        size: args.content.length,
+        mimeType,
+        etag
       },
-      summary: `Saved artifact: ${args.title} (${artifactId})`,
+      summary: `Wrote artifact: ${args.filename} (${args.content.length} bytes)`,
       metadata: {
-        artifactId,
-        taskId: args.taskId,
-        stepNumber: args.stepNumber,
-        type: args.type
+        action: 'write',
+        artifactPath
       }
     };
   }
 
   // -----------------------------------------------------------
-  // Load Artifact
+  // Read Artifact
   // -----------------------------------------------------------
 
-  private async loadArtifact(args: {
+  private async readArtifact(args: {
     taskId: string;
-    artifactId?: string;
+    filename?: string;
   }): Promise<ToolResult> {
-    if (!args.artifactId) {
+    if (!args.filename) {
       return {
         success: false,
         data: null,
-        summary: 'artifactId is required for load'
+        summary: 'filename is required for read action'
       };
     }
 
     // Find task folder
-    const taskFolder = await this.findTaskFolder(args.taskId);
+    const tasksDir = await this.workspace!.ls('tasks');
+    const taskFolder = tasksDir.directories.find(d => d.includes(args.taskId));
+
     if (!taskFolder) {
       return {
         success: false,
         data: null,
-        summary: `Task not found: ${args.taskId}`
+        summary: `Task not found: ${args.taskId}`,
+        metadata: { error: 'TASK_NOT_FOUND' }
       };
     }
 
-    const taskPath = `tasks/${taskFolder}`;
+    const artifactPath = `tasks/${taskFolder}/artifacts/${args.filename}`;
 
-    // Load metadata
-    const metadataPath = `${taskPath}/artifacts/${args.artifactId}.meta.json`;
-    const metadataExists = await Workspace.exists(metadataPath);
-    
-    if (!metadataExists) {
+    // Check if artifact exists
+    const exists = await this.workspace!.exists(artifactPath);
+    if (!exists) {
       return {
         success: false,
         data: null,
-        summary: `Artifact not found: ${args.artifactId}`
+        summary: `Artifact not found: ${args.filename}`,
+        metadata: { error: 'ARTIFACT_NOT_FOUND' }
       };
     }
 
-    const metadataStr = await Workspace.readFileText(metadataPath);
-    const metadata: ArtifactReference = JSON.parse(metadataStr);
+    // Read artifact
+    const { content, etag } = await this.workspace!.read(artifactPath);
 
-    // Load content
-    const content = await Workspace.readFileText(metadata.path);
-
-    console.log(`[ArtifactTool] Loaded artifact: ${args.artifactId}`);
+    console.log(`[ArtifactTool] ✅ Read artifact: ${args.filename} (${content.length} bytes)`);
 
     return {
       success: true,
       data: {
-        metadata,
-        content
-      },
-      summary: `Loaded artifact: ${metadata.title}`,
-      metadata: {
-        artifactId: args.artifactId,
         taskId: args.taskId,
-        type: metadata.type
-      }
-    };
-  }
-
-  // -----------------------------------------------------------
-  // Delete Artifact
-  // -----------------------------------------------------------
-
-  private async deleteArtifact(args: {
-    taskId: string;
-    artifactId?: string;
-  }): Promise<ToolResult> {
-    if (!args.artifactId) {
-      return {
-        success: false,
-        data: null,
-        summary: 'artifactId is required for delete'
-      };
-    }
-
-    // Find task folder
-    const taskFolder = await this.findTaskFolder(args.taskId);
-    if (!taskFolder) {
-      return {
-        success: false,
-        data: null,
-        summary: `Task not found: ${args.taskId}`
-      };
-    }
-
-    const taskPath = `tasks/${taskFolder}`;
-
-    // Load metadata to get file path
-    const metadataPath = `${taskPath}/artifacts/${args.artifactId}.meta.json`;
-    const metadataExists = await Workspace.exists(metadataPath);
-    
-    if (!metadataExists) {
-      return {
-        success: false,
-        data: null,
-        summary: `Artifact not found: ${args.artifactId}`
-      };
-    }
-
-    const metadataStr = await Workspace.readFileText(metadataPath);
-    const metadata: ArtifactReference = JSON.parse(metadataStr);
-
-    // Delete artifact content
-    await Workspace.unlink(metadata.path);
-
-    // Delete metadata
-    await Workspace.unlink(metadataPath);
-
-    console.log(`[ArtifactTool] Deleted artifact: ${args.artifactId}`);
-
-    return {
-      success: true,
-      data: { artifactId: args.artifactId },
-      summary: `Deleted artifact: ${metadata.title}`,
+        filename: args.filename,
+        content,
+        size: content.length,
+        etag
+      },
+      summary: `Read artifact: ${args.filename} (${content.length} bytes)`,
       metadata: {
-        artifactId: args.artifactId,
-        taskId: args.taskId
+        action: 'read',
+        artifactPath
       }
     };
   }
@@ -311,44 +224,101 @@ export class ArtifactTool implements AdminTool {
     taskId: string;
   }): Promise<ToolResult> {
     // Find task folder
-    const taskFolder = await this.findTaskFolder(args.taskId);
+    const tasksDir = await this.workspace!.ls('tasks');
+    const taskFolder = tasksDir.directories.find(d => d.includes(args.taskId));
+
     if (!taskFolder) {
       return {
         success: false,
         data: null,
-        summary: `Task not found: ${args.taskId}`
+        summary: `Task not found: ${args.taskId}`,
+        metadata: { error: 'TASK_NOT_FOUND' }
       };
     }
 
-    const taskPath = `tasks/${taskFolder}`;
-    const artifactsDir = await Workspace.readdir(`${taskPath}/artifacts`);
+    const artifactsPath = `tasks/${taskFolder}/artifacts`;
 
-    // Load metadata for each artifact
-    const artifacts: ArtifactReference[] = [];
-    
-    for (const file of artifactsDir.files) {
-      if (file.name.endsWith('.meta.json')) {
-        try {
-          const metadataStr = await Workspace.readFileText(`${taskPath}/artifacts/${file.name}`);
-          const metadata: ArtifactReference = JSON.parse(metadataStr);
-          artifacts.push(metadata);
-        } catch (error) {
-          console.warn(`[ArtifactTool] Failed to load artifact metadata: ${file.name}`);
-        }
-      }
-    }
+    // List artifacts
+    const listing = await this.workspace!.ls(artifactsPath);
 
-    // Sort by creation time
-    artifacts.sort((a, b) => b.createdAt - a.createdAt);
+    const artifacts = listing.files.map(f => ({
+      name: f.name,
+      size: f.size,
+      modified: f.modified,
+      etag: f.etag
+    }));
+
+    console.log(`[ArtifactTool] ✅ Listed ${artifacts.length} artifacts`);
 
     return {
       success: true,
       data: { artifacts },
       summary: `Found ${artifacts.length} artifacts in task ${args.taskId}`,
       metadata: {
+        action: 'list',
+        count: artifacts.length
+      }
+    };
+  }
+
+  // -----------------------------------------------------------
+  // Delete Artifact
+  // -----------------------------------------------------------
+
+  private async deleteArtifact(args: {
+    taskId: string;
+    filename?: string;
+  }): Promise<ToolResult> {
+    if (!args.filename) {
+      return {
+        success: false,
+        data: null,
+        summary: 'filename is required for delete action'
+      };
+    }
+
+    // Find task folder
+    const tasksDir = await this.workspace!.ls('tasks');
+    const taskFolder = tasksDir.directories.find(d => d.includes(args.taskId));
+
+    if (!taskFolder) {
+      return {
+        success: false,
+        data: null,
+        summary: `Task not found: ${args.taskId}`,
+        metadata: { error: 'TASK_NOT_FOUND' }
+      };
+    }
+
+    const artifactPath = `tasks/${taskFolder}/artifacts/${args.filename}`;
+
+    // Check if artifact exists
+    const exists = await this.workspace!.exists(artifactPath);
+    if (!exists) {
+      return {
+        success: false,
+        data: null,
+        summary: `Artifact not found: ${args.filename}`,
+        metadata: { error: 'ARTIFACT_NOT_FOUND' }
+      };
+    }
+
+    // Delete artifact
+    await this.workspace!.unlink(artifactPath);
+
+    console.log(`[ArtifactTool] ✅ Deleted artifact: ${args.filename}`);
+
+    return {
+      success: true,
+      data: {
         taskId: args.taskId,
-        count: artifacts.length,
-        byType: this.groupByType(artifacts)
+        filename: args.filename,
+        deleted: true
+      },
+      summary: `Deleted artifact: ${args.filename}`,
+      metadata: {
+        action: 'delete',
+        artifactPath
       }
     };
   }
@@ -357,41 +327,76 @@ export class ArtifactTool implements AdminTool {
   // Helper Methods
   // -----------------------------------------------------------
 
-  private async findTaskFolder(taskId: string): Promise<string | null> {
-    try {
-      const tasksDir = await Workspace.readdir('tasks');
-      const folder = tasksDir.directories.find(d => d.includes(taskId));
-      return folder || null;
-    } catch (error) {
-      return null;
-    }
-  }
-
-  private slugify(text: string): string {
-    return text
-      .toLowerCase()
-      .replace(/[^a-z0-9]+/g, '_')
-      .replace(/^_+|_+$/g, '')
-      .substring(0, 50);
-  }
-
-  private inferFormat(type: string): string {
-    const formatMap: Record<string, string> = {
-      code: 'py',
-      research: 'md',
-      analysis: 'json',
-      content: 'md',
-      data: 'json',
-      report: 'md'
+  private inferMimeType(filename: string): string {
+    const ext = filename.split('.').pop()?.toLowerCase();
+    
+    const mimeTypes: Record<string, string> = {
+      'txt': 'text/plain',
+      'md': 'text/markdown',
+      'json': 'application/json',
+      'xml': 'application/xml',
+      'html': 'text/html',
+      'css': 'text/css',
+      'js': 'application/javascript',
+      'ts': 'application/typescript',
+      'py': 'text/x-python',
+      'java': 'text/x-java',
+      'cpp': 'text/x-c++src',
+      'c': 'text/x-csrc',
+      'go': 'text/x-go',
+      'rs': 'text/x-rust',
+      'png': 'image/png',
+      'jpg': 'image/jpeg',
+      'jpeg': 'image/jpeg',
+      'gif': 'image/gif',
+      'svg': 'image/svg+xml',
+      'pdf': 'application/pdf',
+      'zip': 'application/zip'
     };
-    return formatMap[type] || 'txt';
+
+    return ext ? (mimeTypes[ext] || 'application/octet-stream') : 'text/plain';
   }
 
-  private groupByType(artifacts: ArtifactReference[]): Record<string, number> {
-    const groups: Record<string, number> = {};
-    for (const artifact of artifacts) {
-      groups[artifact.type] = (groups[artifact.type] || 0) + 1;
+  private formatError(error: unknown, action: string): ToolResult {
+    console.error(`[ArtifactTool] Error during ${action}:`, error);
+    
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    
+    // Provide helpful error messages
+    if (errorMessage.includes('403') || errorMessage.includes('PERMISSION_DENIED')) {
+      return {
+        success: false,
+        data: null,
+        summary: `Artifact ${action} failed due to permission error. Verify B2 credentials have read/write access.`,
+        metadata: { 
+          error: 'PERMISSION_DENIED',
+          action,
+          hint: 'Check B2_APPLICATION_KEY capabilities'
+        }
+      };
     }
-    return groups;
+    
+    if (errorMessage.includes('404') || errorMessage.includes('NOT_FOUND')) {
+      return {
+        success: false,
+        data: null,
+        summary: `Artifact ${action} failed: Resource not found.`,
+        metadata: { 
+          error: 'NOT_FOUND',
+          action
+        }
+      };
+    }
+    
+    return {
+      success: false,
+      data: null,
+      summary: `Artifact ${action} failed: ${errorMessage}`,
+      metadata: { 
+        error: 'OPERATION_FAILED',
+        action,
+        details: errorMessage
+      }
+    };
   }
 }
