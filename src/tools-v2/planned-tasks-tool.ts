@@ -1,4 +1,4 @@
-// src/tools-v2/planned-tasks-tool.ts - FIXED: Use Workspace singleton
+// src/tools-v2/planned-tasks-tool.ts - FULLY FIXED VERSION
 
 import { Workspace } from '../workspace/workspace';
 import type {
@@ -10,16 +10,18 @@ import type {
 } from './tool-types';
 
 /**
- * Task Management System (FIXED)
+ * Task Management System (FULLY FIXED)
  * 
- * FIXES:
- * ✅ Removed workspace constructor parameter
- * ✅ Uses Workspace singleton directly
- * ✅ Consistent with other workspace-using tools
+ * Fixes included:
+ * ✅ Uses Workspace singleton (no constructor param)
+ * ✅ Steps are always normalized with proper `number`, `status`, `workerType`
+ * ✅ Old/broken tasks are auto-repaired on load
+ * ✅ Task status is always correctly computed (never prematurely "completed")
+ * ✅ Robust status recomputation in both create/load/update
+ * ✅ Safe note appending, proper timestamps, clean checkpoints
  */
 export class PlannedTasksTool implements AdminTool {
-  // No constructor needed - uses Workspace singleton
-  
+
   getDeclaration(): FunctionDeclaration {
     return {
       name: 'planned_tasks',
@@ -50,12 +52,13 @@ export class PlannedTasksTool implements AdminTool {
           },
           stepNumber: {
             type: 'number',
-            description: 'Step number to update (for update_task)'
+            description: 'Step number to update (optional for update_task - if omitted, only status is recomputed)'
           },
           stepStatus: {
             type: 'string',
             enum: ['pending', 'in_progress', 'completed', 'skipped', 'failed'],
             description: 'New status for the step (for update_task)'
+          },
           },
           stepOutput: {
             type: 'string',
@@ -77,7 +80,6 @@ export class PlannedTasksTool implements AdminTool {
     stepStatus?: TodoStep['status'];
     stepOutput?: string;
   }): Promise<ToolResult> {
-    // Check workspace availability using singleton
     if (!Workspace.isInitialized()) {
       return {
         success: false,
@@ -121,31 +123,25 @@ export class PlannedTasksTool implements AdminTool {
     }
   }
 
-  // -----------------------------------------------------------
-  // Implementation methods remain the same
-  // Just replace any this.workspace calls with Workspace.method()
-  // -----------------------------------------------------------
-
   private async createNewTask(args: {
     title?: string;
     description?: string;
     todo?: Partial<TodoStructure>;
   }): Promise<ToolResult> {
-    if (!args.title || !args.description || !args.todo) {
+    if (!args.title || !args.description || !args.todo?.steps) {
       return {
         success: false,
         data: null,
-        summary: 'Missing required fields: title, description, and todo are required'
+        summary: 'Missing required fields: title, description, and todo.steps array are required'
       };
     }
-
-    console.log('[PlannedTasks] Creating new task:', args.title);
 
     const taskId = `task_${Date.now()}_${this.slugify(args.title)}`;
     const taskPath = `tasks/${taskId}`;
 
+    console.log('[PlannedTasks] Creating new task:', args.title);
+
     try {
-      // Create directory structure using Workspace singleton
       await Workspace.mkdir(taskPath);
       await Workspace.mkdir(`${taskPath}/artifacts`);
       await Workspace.mkdir(`${taskPath}/checkpoints`);
@@ -154,23 +150,27 @@ export class PlannedTasksTool implements AdminTool {
       throw new Error(`Failed to create task directories: ${mkdirError instanceof Error ? mkdirError.message : String(mkdirError)}`);
     }
 
-    // Create metadata
-    const metadata = {
-      taskId,
-      title: args.title,
-      status: 'pending',
-      createdAt: Date.now(),
-      updatedAt: Date.now(),
-      tags: args.todo.metadata?.tags || []
-    };
+    // Normalize & validate steps
+    const steps: TodoStep[] = (args.todo.steps || []).map((step: Partial<TodoStep>, index: number): TodoStep => ({
+      number: index + 1,
+      title: step.title ?? `Step ${index + 1}`,
+      workerType: step.workerType ?? 'agent',
+      status: (step.status as TodoStep['status']) ?? 'pending',
+      checkpoint: step.checkpoint ?? false,
+      objective: step.objective ?? '',
+      requirements: step.requirements ?? [],
+      outputs: step.outputs ?? [],
+      notes: step.notes ?? undefined,
+      startedAt: step.startedAt,
+      completedAt: step.completedAt,
+    }));
 
-    // Create todo structure
     const todo: TodoStructure = {
       taskId,
       title: args.title,
       description: args.description,
-      status: 'pending',
-      steps: args.todo.steps || [],
+      status: steps.length === 0 ? 'completed' : 'pending',
+      steps,
       metadata: {
         createdAt: Date.now(),
         updatedAt: Date.now(),
@@ -178,29 +178,30 @@ export class PlannedTasksTool implements AdminTool {
       }
     };
 
-    // Write files using Workspace singleton
+    this.recomputeTaskStatus(todo); // ensures correct status even if user set weird statuses
+
+    const metadata = {
+      taskId,
+      title: args.title,
+      status: todo.status,
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      tags: args.todo.metadata?.tags || []
+    };
+
     try {
-      console.log('[PlannedTasks] Writing description.md');
       await Workspace.writeFile(`${taskPath}/description.md`, args.description, 'text/markdown');
-      
-      console.log('[PlannedTasks] Writing metadata.json');
       await Workspace.writeFile(`${taskPath}/metadata.json`, JSON.stringify(metadata, null, 2), 'application/json');
-      
-      console.log('[PlannedTasks] Writing todo.json');
       await Workspace.writeFile(`${taskPath}/todo.json`, JSON.stringify(todo, null, 2), 'application/json');
       
-      // Create human-readable plan
       const planMarkdown = this.generatePlanMarkdown(todo);
-      console.log('[PlannedTasks] Writing plan.md');
       await Workspace.writeFile(`${taskPath}/plan.md`, planMarkdown, 'text/markdown');
-      
-      console.log('[PlannedTasks] ✅ All task files written successfully');
     } catch (writeError) {
       console.error('[PlannedTasks] Failed to write task files:', writeError);
       throw new Error(`Failed to write task files: ${writeError instanceof Error ? writeError.message : String(writeError)}`);
     }
 
-    console.log(`[PlannedTasks] ✅ Created task: ${taskId}`);
+    console.log(`[PlannedTasks] ✅ Created task: ${taskId} with ${steps.length} properly numbered steps`);
 
     return {
       success: true,
@@ -211,34 +212,26 @@ export class PlannedTasksTool implements AdminTool {
         metadata,
         action: 'new_task'
       },
-      summary: `Created new task: ${args.title} (${taskId}) with ${todo.steps.length} steps`,
+      summary: `Created new task: ${args.title} (${taskId}) with ${steps.length} steps`,
       metadata: {
         action: 'new_task',
         taskId,
         taskPath,
-        stepCount: todo.steps.length
+        stepCount: steps.length
       }
     };
   }
 
   private async loadTask(args: { taskId?: string }): Promise<ToolResult> {
     if (!args.taskId) {
-      return {
-        success: false,
-        data: null,
-        summary: 'taskId is required for load_task'
-      };
+      return { success: false, data: null, summary: 'taskId is required for load_task' };
     }
 
     const tasksDir = await Workspace.readdir('tasks');
     const taskFolder = tasksDir.directories.find(d => d.includes(args.taskId!));
 
     if (!taskFolder) {
-      return {
-        success: false,
-        data: null,
-        summary: `Task not found: ${args.taskId}`
-      };
+      return { success: false, data: null, summary: `Task not found: ${args.taskId}` };
     }
 
     const taskPath = `tasks/${taskFolder}`;
@@ -249,7 +242,32 @@ export class PlannedTasksTool implements AdminTool {
       const todoStr = await Workspace.readFileText(`${taskPath}/todo.json`);
       
       const metadata = JSON.parse(metadataStr);
-      const todo: TodoStructure = JSON.parse(todoStr);
+      let todo: TodoStructure = JSON.parse(todoStr);
+
+      // ─── Auto-repair old or broken tasks ──────────────────────
+      let modified = false;
+      todo.steps = todo.steps.map((step: any, index: number) => {
+        const fixed = { ...step };
+        if (fixed.number == null) { fixed.number = index + 1; modified = true; }
+        if (!fixed.status) { fixed.status = 'pending'; modified = true; }
+        if (!fixed.workerType) { fixed.workerType = 'agent'; modified = true; true; }
+        return fixed as TodoStep;
+      });
+
+      this.recomputeTaskStatus(todo);
+
+      if (metadata.status !== todo.status) {
+        metadata.status = todo.status;
+        modified = true;
+      }
+
+      if (modified) {
+        todo.metadata.updatedAt = Date.now();
+        metadata.updatedAt = Date.now();
+        await Workspace.writeFile(`${taskPath}/todo.json`, JSON.stringify(todo, null, 2), 'application/json');
+        await Workspace.writeFile(`${taskPath}/metadata.json`, JSON.stringify(metadata, null, 2), 'application/json');
+        console.log(`[PlannedTasks] Auto-repaired broken task on load: ${args.taskId}`);
+      }
 
       const artifactsDir = await Workspace.readdir(`${taskPath}/artifacts`);
       const artifacts = artifactsDir.files.map(f => ({
@@ -275,7 +293,8 @@ export class PlannedTasksTool implements AdminTool {
           taskId: args.taskId,
           stepCount: todo.steps.length,
           artifactCount: artifacts.length,
-          status: todo.status
+          status: todo.status,
+          repaired: modified
         }
       };
     } catch (readError) {
@@ -295,22 +314,14 @@ export class PlannedTasksTool implements AdminTool {
     stepOutput?: string;
   }): Promise<ToolResult> {
     if (!args.taskId) {
-      return {
-        success: false,
-        data: null,
-        summary: 'taskId is required for update_task'
-      };
+      return { success: false, data: null, summary: 'taskId is required for update_task' };
     }
 
     const tasksDir = await Workspace.readdir('tasks');
     const taskFolder = tasksDir.directories.find(d => d.includes(args.taskId!));
 
     if (!taskFolder) {
-      return {
-        success: false,
-        data: null,
-        summary: `Task not found: ${args.taskId}`
-      };
+      return { success: false, data: null, summary: `Task not found: ${args.taskId}` };
     }
 
     const taskPath = `tasks/${taskFolder}`;
@@ -319,20 +330,16 @@ export class PlannedTasksTool implements AdminTool {
       const todoStr = await Workspace.readFileText(`${taskPath}/todo.json`);
       const todo: TodoStructure = JSON.parse(todoStr);
 
+      // Update specific step if requested
       if (args.stepNumber !== undefined) {
         const step = todo.steps.find(s => s.number === args.stepNumber);
-        
         if (!step) {
-          return {
-            success: false,
-            data: null,
-            summary: `Step ${args.stepNumber} not found in task`
-          };
+          return { success: false, data: null, summary: `Step ${args.stepNumber} not found in task` };
         }
 
         if (args.stepStatus) {
           step.status = args.stepStatus;
-          
+
           if (args.stepStatus === 'in_progress' && !step.startedAt) {
             step.startedAt = Date.now();
           }
@@ -342,31 +349,18 @@ export class PlannedTasksTool implements AdminTool {
         }
 
         if (args.stepOutput) {
-          step.notes = args.stepOutput;
+          step.notes = step.notes ? step.notes + '\n\n' + args.stepOutput : args.stepOutput;
         }
       }
 
-      // Update task status based on steps
-      const allCompleted = todo.steps.every(s => 
-        s.status === 'completed' || s.status === 'skipped'
-      );
-      const anyInProgress = todo.steps.some(s => s.status === 'in_progress');
-      const anyFailed = todo.steps.some(s => s.status === 'failed');
-
-      if (allCompleted) {
-        todo.status = 'completed';
-      } else if (anyFailed) {
-        todo.status = 'failed';
-      } else if (anyInProgress) {
-        todo.status = 'in_progress';
-      }
-
+      // Always recompute overall task status
+      this.recomputeTaskStatus(todo);
       todo.metadata.updatedAt = Date.now();
 
-      // Save updated todo
+      // Save todo
       await Workspace.writeFile(`${taskPath}/todo.json`, JSON.stringify(todo, null, 2), 'application/json');
 
-      // Update metadata file
+      // Update metadata
       const metadataStr = await Workspace.readFileText(`${taskPath}/metadata.json`);
       const metadata = JSON.parse(metadataStr);
       metadata.status = todo.status;
@@ -378,7 +372,7 @@ export class PlannedTasksTool implements AdminTool {
       await Workspace.writeFile(checkpointPath, JSON.stringify({
         timestamp: Date.now(),
         todo,
-        stepNumber: args.stepNumber,
+        updatedStep: args.stepNumber ?? null,
         action: 'update'
       }, null, 2), 'application/json');
 
@@ -390,11 +384,11 @@ export class PlannedTasksTool implements AdminTool {
           updatedStep: args.stepNumber,
           action: 'update_task'
         },
-        summary: `Updated task ${args.taskId}: step ${args.stepNumber} -> ${args.stepStatus}`,
+        summary: `Updated task ${args.taskId} → status: ${todo.status}${args.stepNumber ? `, step ${args.stepNumber} → ${args.stepStatus}` : ''}`,
         metadata: {
           action: 'update_task',
           taskStatus: todo.status,
-          stepNumber: args.stepNumber,
+          stepNumber: args.stepNumber ?? null,
           checkpointCreated: true
         }
       };
@@ -445,9 +439,28 @@ export class PlannedTasksTool implements AdminTool {
     }
   }
 
-  // -----------------------------------------------------------
-  // Helper Methods (unchanged)
-  // -----------------------------------------------------------
+  // ──────────────────────── Helpers ────────────────────────
+
+  private recomputeTaskStatus(todo: TodoStructure): void {
+    if (todo.steps.length === 0) {
+      todo.status = 'completed';
+      return;
+    }
+
+    const allCompleted = todo.steps.every(s => s.status === 'completed' || s.status === 'skipped');
+    const anyInProgress = todo.steps.some(s => s.status === 'in_progress');
+    const anyFailed = todo.steps.some(s => s.status === 'failed');
+
+    if (allCompleted) {
+      todo.status = 'completed';
+    } else if (anyFailed) {
+      todo.status = 'failed';
+    } else if (anyInProgress) {
+      todo.status = 'in_progress';
+    } else {
+      todo.status = 'pending';
+    }
+  }
 
   private slugify(text: string): string {
     return text
