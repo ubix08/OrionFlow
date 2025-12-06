@@ -1,77 +1,116 @@
-// src/tools-v2/tool-registry.ts - Enhanced Admin Tool Registry
+// src/tools-v2/tool-registry.ts - Fixed with Workspace Availability
 
 import type { GeminiClient } from '../gemini';
 import type { MemoryManager } from '../memory/memory-manager';
 import type { WorkerFactory } from '../workers/specialized-workers';
-import type { AdminTool, ToolResult, FunctionDeclaration } from './tool-types';
-import {
-  WebSearchTool,
-  MemorySearchTool,
-  KnowledgeSearchTool,
-  DelegateTool,
-  AskUserTool
-} from './admin-tools';
+import type { AdminTool, ToolResult } from './tool-types';
+
+// Import all admin tools
+import { WebSearchTool } from './web-search-tool';
 import { RAGSearchTool } from './rag-search-tool';
+import { AskUserTool } from './ask-user-tool';
+import { DelegateToWorkerTool } from './delegate-worker-tool';
 import { PlannedTasksTool } from './planned-tasks-tool';
 import { ArtifactTool } from './artifact-tool';
 
 /**
- * Central registry for all admin tools
- * Manages function declarations and execution routing
+ * Registry for Admin Agent Tools
+ * 
+ * Manages function declarations and execution of admin-level tools.
+ * Now properly handles workspace availability.
  */
 export class AdminToolRegistry {
-  private tools = new Map<string, AdminTool>();
-  
+  private tools: Map<string, AdminTool>;
+  private gemini: GeminiClient;
+  private memory: MemoryManager | null;
+  private workerFactory: WorkerFactory;
+  private workspaceEnabled: boolean;
+
   constructor(
     gemini: GeminiClient,
     memory: MemoryManager | null,
-    workerFactory: WorkerFactory
+    workerFactory: WorkerFactory,
+    workspaceEnabled: boolean = false  // NEW: Pass workspace availability
   ) {
-    this.registerTools(gemini, memory, workerFactory);
-  }
-  
-  private registerTools(
-    gemini: GeminiClient,
-    memory: MemoryManager | null,
-    workerFactory: WorkerFactory
-  ): void {
-    // Core information gathering tools
-    this.tools.set('web_search', new WebSearchTool(gemini));
+    this.gemini = gemini;
+    this.memory = memory;
+    this.workerFactory = workerFactory;
+    this.workspaceEnabled = workspaceEnabled;
+    this.tools = new Map();
     
-    if (memory) {
-      this.tools.set('search_memory', new MemorySearchTool(memory));
+    this.registerTools();
+    
+    console.log('[AdminToolRegistry] Initialized with tools:', {
+      toolCount: this.tools.size,
+      workspaceEnabled: this.workspaceEnabled,
+      tools: Array.from(this.tools.keys())
+    });
+  }
+
+  private registerTools(): void {
+    // Core coordination tools (always available)
+    this.tools.set('web_search', new WebSearchTool(this.gemini));
+    this.tools.set('ask_user', new AskUserTool());
+    this.tools.set('delegate_to_worker', new DelegateToWorkerTool(
+      this.workerFactory,
+      this.workspaceEnabled  // Pass flag to delegate tool too
+    ));
+    
+    // Memory-dependent tools
+    if (this.memory) {
+      this.tools.set('rag_search', new RAGSearchTool(this.memory));
     }
     
-    this.tools.set('search_knowledge', new KnowledgeSearchTool(gemini));
+    // Workspace-dependent tools (pass availability flag)
+    this.tools.set('planned_tasks', new PlannedTasksTool(this.workspaceEnabled));
+    this.tools.set('artifact_tool', new ArtifactTool(this.workspaceEnabled));
     
-    // Enhanced RAG search across multiple sources
-    this.tools.set('rag_search', new RAGSearchTool(gemini, memory));
-    
-    // Task management system
-    this.tools.set('planned_tasks', new PlannedTasksTool());
-    
-    // Artifact lifecycle management
-    this.tools.set('artifact_tool', new ArtifactTool());
-    
-    // Worker delegation
-    this.tools.set('delegate_to_worker', new DelegateTool(workerFactory));
-    
-    // User interaction
-    this.tools.set('ask_user', new AskUserTool());
-    
-    console.log(`[ToolRegistry] Registered ${this.tools.size} admin tools`);
+    console.log('[AdminToolRegistry] Registered tools:', {
+      workspace: this.workspaceEnabled ? 'enabled' : 'disabled',
+      memory: this.memory ? 'enabled' : 'disabled'
+    });
   }
-  
+
   /**
    * Get function declarations for Gemini function calling
    */
-  getFunctionDeclarations(): FunctionDeclaration[] {
-    return Array.from(this.tools.values()).map(tool => tool.getDeclaration());
+  getFunctionDeclarations(): any[] {
+    const declarations: any[] = [];
+    
+    for (const [name, tool] of this.tools) {
+      // Skip workspace tools if workspace is disabled (optional: can keep them with degraded mode)
+      // Keeping them allows graceful error messages
+      declarations.push({
+        name: tool.name,
+        description: this.enhanceDescription(tool),
+        parameters: tool.parameters
+      });
+    }
+    
+    return declarations;
   }
-  
+
   /**
-   * Execute a tool by name with arguments
-   * Returns structured ToolResult with typed data
+   * Enhance tool descriptions with availability info
+   */
+  private enhanceDescription(tool: AdminTool): string {
+    let description = tool.description;
+    
+    // Add workspace availability notice
+    if ((tool.name === 'planned_tasks' || tool.name === 'artifact_tool') && !this.workspaceEnabled) {
+      description += '\n⚠️ Note: This tool requires workspace configuration (B2 storage). Currently unavailable.';
+    }
+    
+    // Add memory availability notice
+    if (tool.name === 'rag_search' && !this.memory) {
+      description += '\n⚠️ Note: This tool requires memory/vectorize configuration. Currently unavailable.';
+    }
+    
+    return description;
+  }
+
+  /**
+   * Execute a tool by name
    */
   async executeTool(name: string, args: any): Promise<ToolResult> {
     const tool = this.tools.get(name);
@@ -79,60 +118,90 @@ export class AdminToolRegistry {
     if (!tool) {
       return {
         success: false,
-        data: null,
         summary: `Unknown tool: ${name}`,
-        metadata: { error: 'TOOL_NOT_FOUND' }
+        data: null,
+        metadata: { errorCode: 'UNKNOWN_TOOL' }
       };
     }
     
     try {
-      console.log(`[ToolRegistry] Executing ${name} with args:`, JSON.stringify(args).substring(0, 200));
+      console.log(`[AdminToolRegistry] Executing tool: ${name}`, {
+        args,
+        workspaceEnabled: this.workspaceEnabled
+      });
+      
       const result = await tool.execute(args);
-      console.log(`[ToolRegistry] ${name} completed:`, result.success ? 'SUCCESS' : 'FAILED');
+      
+      console.log(`[AdminToolRegistry] Tool ${name} completed:`, {
+        success: result.success,
+        summary: result.summary?.substring(0, 100)
+      });
+      
       return result;
+      
     } catch (error) {
-      console.error(`[ToolRegistry] ${name} error:`, error);
+      console.error(`[AdminToolRegistry] Tool ${name} error:`, error);
+      
       return {
         success: false,
-        data: null,
         summary: `Tool execution failed: ${error instanceof Error ? error.message : String(error)}`,
-        metadata: { error: 'EXECUTION_ERROR' }
+        data: null,
+        metadata: { 
+          errorCode: 'TOOL_EXECUTION_ERROR',
+          errorMessage: error instanceof Error ? error.message : String(error)
+        }
       };
     }
   }
-  
+
   /**
-   * Check if a tool requires user input (ask_user)
+   * Check if a tool requires user input (for flow control)
    */
   isUserInputRequired(toolName: string, result: ToolResult): boolean {
-    return toolName === 'ask_user' || result.metadata?.requiresUserInput === true;
+    return toolName === 'ask_user' && result.success;
   }
-  
+
   /**
-   * Get tool by name
+   * Get available tools info (for debugging/status)
    */
-  getTool(name: string): AdminTool | undefined {
-    return this.tools.get(name);
+  getAvailableTools(): Array<{ name: string; available: boolean; reason?: string }> {
+    const tools: Array<{ name: string; available: boolean; reason?: string }> = [];
+    
+    for (const [name, tool] of this.tools) {
+      let available = true;
+      let reason: string | undefined;
+      
+      // Check workspace dependencies
+      if ((name === 'planned_tasks' || name === 'artifact_tool') && !this.workspaceEnabled) {
+        available = false;
+        reason = 'Workspace not configured (B2 storage required)';
+      }
+      
+      // Check memory dependencies
+      if (name === 'rag_search' && !this.memory) {
+        available = false;
+        reason = 'Memory/Vectorize not configured';
+      }
+      
+      tools.push({ name, available, reason });
+    }
+    
+    return tools;
   }
-  
+
   /**
-   * List all available tool names
+   * Check if workspace-dependent features are available
    */
-  getToolNames(): string[] {
-    return Array.from(this.tools.keys());
+  isWorkspaceAvailable(): boolean {
+    return this.workspaceEnabled;
   }
-  
+
   /**
-   * Get tool metadata for debugging
+   * Check if memory-dependent features are available
    */
-  getToolMetadata(): Array<{ name: string; description: string; parameters: any }> {
-    return Array.from(this.tools.entries()).map(([name, tool]) => {
-      const declaration = tool.getDeclaration();
-      return {
-        name,
-        description: declaration.description,
-        parameters: declaration.parameters
-      };
-    });
+  isMemoryAvailable(): boolean {
+    return this.memory !== null;
   }
 }
+
+export default AdminToolRegistry;
