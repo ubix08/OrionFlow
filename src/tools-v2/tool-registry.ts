@@ -1,8 +1,9 @@
-// src/tools-v2/tool-registry.ts - Enhanced Admin Tool Registry
+// src/tools-v2/tool-registry.ts - Enhanced Admin Tool Registry (FIXED)
 
 import type { GeminiClient } from '../gemini';
 import type { MemoryManager } from '../memory/memory-manager';
 import type { WorkerFactory } from '../workers/specialized-workers';
+import type { WorkspaceImpl } from '../workspace/workspace';
 import type { AdminTool, ToolResult, FunctionDeclaration } from './tool-types';
 import {
   WebSearchTool,
@@ -16,8 +17,12 @@ import { PlannedTasksTool } from './planned-tasks-tool';
 import { ArtifactTool } from './artifact-tool';
 
 /**
- * Central registry for all admin tools
- * Manages function declarations and execution routing
+ * Central registry for all admin tools (FIXED)
+ * 
+ * FIXES APPLIED:
+ * ✅ Dependency injection for workspace (no singleton)
+ * ✅ Workspace availability passed to tools that need it
+ * ✅ Clear separation of tool registration and initialization
  */
 export class AdminToolRegistry {
   private tools = new Map<string, AdminTool>();
@@ -25,15 +30,17 @@ export class AdminToolRegistry {
   constructor(
     gemini: GeminiClient,
     memory: MemoryManager | null,
-    workerFactory: WorkerFactory
+    workerFactory: WorkerFactory,
+    workspace: WorkspaceImpl | null // NEW: Explicit dependency injection
   ) {
-    this.registerTools(gemini, memory, workerFactory);
+    this.registerTools(gemini, memory, workerFactory, workspace);
   }
   
   private registerTools(
     gemini: GeminiClient,
     memory: MemoryManager | null,
-    workerFactory: WorkerFactory
+    workerFactory: WorkerFactory,
+    workspace: WorkspaceImpl | null
   ): void {
     // Core information gathering tools
     this.tools.set('web_search', new WebSearchTool(gemini));
@@ -47,11 +54,11 @@ export class AdminToolRegistry {
     // Enhanced RAG search across multiple sources
     this.tools.set('rag_search', new RAGSearchTool(gemini, memory));
     
-    // Task management system
-    this.tools.set('planned_tasks', new PlannedTasksTool());
+    // Task management system (with workspace dependency)
+    this.tools.set('planned_tasks', new PlannedTasksTool(workspace));
     
-    // Artifact lifecycle management
-    this.tools.set('artifact_tool', new ArtifactTool());
+    // Artifact lifecycle management (with workspace dependency)
+    this.tools.set('artifact_tool', new ArtifactTool(workspace));
     
     // Worker delegation
     this.tools.set('delegate_to_worker', new DelegateTool(workerFactory));
@@ -59,7 +66,11 @@ export class AdminToolRegistry {
     // User interaction
     this.tools.set('ask_user', new AskUserTool());
     
-    console.log(`[ToolRegistry] Registered ${this.tools.size} admin tools`);
+    const workspaceStatus = workspace ? 'enabled' : 'disabled';
+    console.log(
+      `[ToolRegistry] Registered ${this.tools.size} admin tools ` +
+      `(workspace: ${workspaceStatus})`
+    );
   }
   
   /**
@@ -86,9 +97,14 @@ export class AdminToolRegistry {
     }
     
     try {
-      console.log(`[ToolRegistry] Executing ${name} with args:`, JSON.stringify(args).substring(0, 200));
+      const argsPreview = JSON.stringify(args).substring(0, 200);
+      console.log(`[ToolRegistry] Executing ${name} with args: ${argsPreview}`);
+      
       const result = await tool.execute(args);
-      console.log(`[ToolRegistry] ${name} completed:`, result.success ? 'SUCCESS' : 'FAILED');
+      
+      const status = result.success ? 'SUCCESS' : 'FAILED';
+      console.log(`[ToolRegistry] ${name} completed: ${status}`);
+      
       return result;
     } catch (error) {
       console.error(`[ToolRegistry] ${name} error:`, error);
@@ -96,7 +112,11 @@ export class AdminToolRegistry {
         success: false,
         data: null,
         summary: `Tool execution failed: ${error instanceof Error ? error.message : String(error)}`,
-        metadata: { error: 'EXECUTION_ERROR' }
+        metadata: { 
+          error: 'EXECUTION_ERROR',
+          toolName: name,
+          details: error instanceof Error ? error.message : String(error)
+        }
       };
     }
   }
