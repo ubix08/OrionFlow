@@ -1,4 +1,4 @@
-{
+y{
   "name": "Orion",
   "version": "2.0.0",
   "description": "Suna-like autonomous agent on Cloudflare Workers free-tier — real Python, POSIX workspace, zero external cost",
@@ -36,7 +36,8 @@
   },
   "dependencies": {
     "@google/genai": "^1.28.0",
-    "aws4fetch":"^1.0.20",
+    "@aws-sdk/client-s3": "^3.570.0",
+  	"@aws-sdk/s3-request-presigner": "^3.570.0",
     "zod": "^3.25.76"
   }
 }
