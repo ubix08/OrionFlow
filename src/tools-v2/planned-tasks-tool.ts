@@ -1,4 +1,4 @@
-// src/tools-v2/planned-tasks-tool.ts - Task Management System
+// src/tools-v2/planned-tasks-tool.ts - FIXED: Use Workspace singleton
 
 import { Workspace } from '../workspace/workspace';
 import type {
@@ -9,7 +9,17 @@ import type {
   TodoStep
 } from './tool-types';
 
+/**
+ * Task Management System (FIXED)
+ * 
+ * FIXES:
+ * ✅ Removed workspace constructor parameter
+ * ✅ Uses Workspace singleton directly
+ * ✅ Consistent with other workspace-using tools
+ */
 export class PlannedTasksTool implements AdminTool {
+  // No constructor needed - uses Workspace singleton
+  
   getDeclaration(): FunctionDeclaration {
     return {
       name: 'planned_tasks',
@@ -20,7 +30,7 @@ export class PlannedTasksTool implements AdminTool {
           action: {
             type: 'string',
             enum: ['new_task', 'load_task', 'update_task', 'list_tasks'],
-            description: 'Action to perform: new_task (create), load_task (load for continuation), update_task (update progress), list_tasks (list all)'
+            description: 'Action: new_task (create), load_task (load for continuation), update_task (update progress), list_tasks (list all)'
           },
           taskId: {
             type: 'string',
@@ -67,12 +77,16 @@ export class PlannedTasksTool implements AdminTool {
     stepStatus?: TodoStep['status'];
     stepOutput?: string;
   }): Promise<ToolResult> {
+    // Check workspace availability using singleton
     if (!Workspace.isInitialized()) {
       return {
         success: false,
         data: null,
-        summary: 'Workspace not initialized. Cannot manage tasks.',
-        metadata: { error: 'WORKSPACE_NOT_AVAILABLE' }
+        summary: 'Workspace not initialized. Task management requires B2 storage configuration.',
+        metadata: { 
+          error: 'WORKSPACE_NOT_AVAILABLE',
+          hint: 'Configure B2_KEY_ID, B2_APPLICATION_KEY, B2_S3_ENDPOINT, and B2_BUCKET'
+        }
       };
     }
 
@@ -108,7 +122,8 @@ export class PlannedTasksTool implements AdminTool {
   }
 
   // -----------------------------------------------------------
-  // Create New Task
+  // Implementation methods remain the same
+  // Just replace any this.workspace calls with Workspace.method()
   // -----------------------------------------------------------
 
   private async createNewTask(args: {
@@ -126,21 +141,13 @@ export class PlannedTasksTool implements AdminTool {
 
     console.log('[PlannedTasks] Creating new task:', args.title);
 
-    // Generate task ID and folder name
     const taskId = `task_${Date.now()}_${this.slugify(args.title)}`;
     const taskPath = `tasks/${taskId}`;
 
-    console.log('[PlannedTasks] Task path:', taskPath);
-
-    // Create directory structure
     try {
-      console.log('[PlannedTasks] Creating directory:', taskPath);
+      // Create directory structure using Workspace singleton
       await Workspace.mkdir(taskPath);
-      
-      console.log('[PlannedTasks] Creating artifacts directory');
       await Workspace.mkdir(`${taskPath}/artifacts`);
-      
-      console.log('[PlannedTasks] Creating checkpoints directory');
       await Workspace.mkdir(`${taskPath}/checkpoints`);
     } catch (mkdirError) {
       console.error('[PlannedTasks] Failed to create directories:', mkdirError);
@@ -171,20 +178,13 @@ export class PlannedTasksTool implements AdminTool {
       }
     };
 
-    // Write files
+    // Write files using Workspace singleton
     try {
-      console.log('[PlannedTasks] Writing description.md');
       await Workspace.writeFile(`${taskPath}/description.md`, args.description, 'text/markdown');
-      
-      console.log('[PlannedTasks] Writing metadata.json');
       await Workspace.writeFile(`${taskPath}/metadata.json`, JSON.stringify(metadata, null, 2), 'application/json');
-      
-      console.log('[PlannedTasks] Writing todo.json');
       await Workspace.writeFile(`${taskPath}/todo.json`, JSON.stringify(todo, null, 2), 'application/json');
       
-      // Create human-readable plan
       const planMarkdown = this.generatePlanMarkdown(todo);
-      console.log('[PlannedTasks] Writing plan.md');
       await Workspace.writeFile(`${taskPath}/plan.md`, planMarkdown, 'text/markdown');
     } catch (writeError) {
       console.error('[PlannedTasks] Failed to write task files:', writeError);
@@ -212,13 +212,7 @@ export class PlannedTasksTool implements AdminTool {
     };
   }
 
-  // -----------------------------------------------------------
-  // Load Existing Task
-  // -----------------------------------------------------------
-
-  private async loadTask(args: {
-    taskId?: string;
-  }): Promise<ToolResult> {
+  private async loadTask(args: { taskId?: string }): Promise<ToolResult> {
     if (!args.taskId) {
       return {
         success: false,
@@ -227,9 +221,6 @@ export class PlannedTasksTool implements AdminTool {
       };
     }
 
-    console.log('[PlannedTasks] Loading task:', args.taskId);
-
-    // Find task folder (search by ID)
     const tasksDir = await Workspace.readdir('tasks');
     const taskFolder = tasksDir.directories.find(d => d.includes(args.taskId!));
 
@@ -243,10 +234,7 @@ export class PlannedTasksTool implements AdminTool {
 
     const taskPath = `tasks/${taskFolder}`;
 
-    // Load task files
     try {
-      console.log('[PlannedTasks] Reading task files from:', taskPath);
-      
       const description = await Workspace.readFileText(`${taskPath}/description.md`);
       const metadataStr = await Workspace.readFileText(`${taskPath}/metadata.json`);
       const todoStr = await Workspace.readFileText(`${taskPath}/todo.json`);
@@ -254,15 +242,12 @@ export class PlannedTasksTool implements AdminTool {
       const metadata = JSON.parse(metadataStr);
       const todo: TodoStructure = JSON.parse(todoStr);
 
-      // Load artifacts list
       const artifactsDir = await Workspace.readdir(`${taskPath}/artifacts`);
       const artifacts = artifactsDir.files.map(f => ({
         name: f.name,
         size: f.size,
         modified: f.modified
       }));
-
-      console.log(`[PlannedTasks] ✅ Loaded task: ${args.taskId}`);
 
       return {
         success: true,
@@ -294,10 +279,6 @@ export class PlannedTasksTool implements AdminTool {
     }
   }
 
-  // -----------------------------------------------------------
-  // Update Task Progress
-  // -----------------------------------------------------------
-
   private async updateTask(args: {
     taskId?: string;
     stepNumber?: number;
@@ -312,9 +293,6 @@ export class PlannedTasksTool implements AdminTool {
       };
     }
 
-    console.log('[PlannedTasks] Updating task:', args.taskId, 'step:', args.stepNumber);
-
-    // Find task folder
     const tasksDir = await Workspace.readdir('tasks');
     const taskFolder = tasksDir.directories.find(d => d.includes(args.taskId!));
 
@@ -328,12 +306,10 @@ export class PlannedTasksTool implements AdminTool {
 
     const taskPath = `tasks/${taskFolder}`;
 
-    // Load current todo
     try {
       const todoStr = await Workspace.readFileText(`${taskPath}/todo.json`);
       const todo: TodoStructure = JSON.parse(todoStr);
 
-      // Update step if specified
       if (args.stepNumber !== undefined) {
         const step = todo.steps.find(s => s.number === args.stepNumber);
         
@@ -345,7 +321,6 @@ export class PlannedTasksTool implements AdminTool {
           };
         }
 
-        // Update step status
         if (args.stepStatus) {
           step.status = args.stepStatus;
           
@@ -357,12 +332,9 @@ export class PlannedTasksTool implements AdminTool {
           }
         }
 
-        // Add notes/output
         if (args.stepOutput) {
           step.notes = args.stepOutput;
         }
-
-        console.log(`[PlannedTasks] Updated step ${args.stepNumber}: ${args.stepStatus}`);
       }
 
       // Update task status based on steps
@@ -380,7 +352,6 @@ export class PlannedTasksTool implements AdminTool {
         todo.status = 'in_progress';
       }
 
-      // Update metadata
       todo.metadata.updatedAt = Date.now();
 
       // Save updated todo
@@ -401,8 +372,6 @@ export class PlannedTasksTool implements AdminTool {
         stepNumber: args.stepNumber,
         action: 'update'
       }, null, 2), 'application/json');
-
-      console.log(`[PlannedTasks] ✅ Updated task: ${args.taskId}`);
 
       return {
         success: true,
@@ -430,13 +399,7 @@ export class PlannedTasksTool implements AdminTool {
     }
   }
 
-  // -----------------------------------------------------------
-  // List All Tasks
-  // -----------------------------------------------------------
-
   private async listTasks(): Promise<ToolResult> {
-    console.log('[PlannedTasks] Listing all tasks');
-
     try {
       const tasksDir = await Workspace.readdir('tasks');
       const tasks: any[] = [];
@@ -451,10 +414,7 @@ export class PlannedTasksTool implements AdminTool {
         }
       }
 
-      // Sort by updatedAt descending
       tasks.sort((a, b) => b.updatedAt - a.updatedAt);
-
-      console.log(`[PlannedTasks] ✅ Found ${tasks.length} tasks`);
 
       return {
         success: true,
@@ -477,7 +437,7 @@ export class PlannedTasksTool implements AdminTool {
   }
 
   // -----------------------------------------------------------
-  // Helper Methods
+  // Helper Methods (unchanged)
   // -----------------------------------------------------------
 
   private slugify(text: string): string {
