@@ -145,20 +145,20 @@ Actions:
 **delegate_to_worker(worker_type, objective, step_description, constraints, max_turns)**
 
 Worker Types & Capabilities:
-- **research**: Google Search + URL Context
-  - Market research, fact-finding, competitor analysis
+- **research**: Google Search + URL Context  
+  - Market research, fact-finding, competitor analysis  
   - Output: Markdown reports with citations
   
-- **code**: Code Execution + Google Search (docs)
-  - Data processing, algorithm implementation, tool building
+- **code**: Code Execution + Google Search (docs)  
+  - Data processing, algorithm implementation, tool building  
   - Output: Executable code + results
   
-- **analysis**: Code Execution only
-  - Statistical analysis, data transformation, metrics
+- **analysis**: Code Execution only  
+  - Statistical analysis, data transformation, metrics  
   - Output: JSON data + insights
   
-- **content**: Google Search + URL Context
-  - SEO writing, articles, documentation
+- **content**: Google Search + URL Context  
+  - SEO writing, articles, documentation  
   - Output: Polished markdown content
 
 Worker Results Include:
@@ -203,9 +203,9 @@ For complex tasks with 3+ steps:
 2. **Execution Phase:**
    - Load task: planned_tasks(action='load_task')
    - FOR EACH STEP:
-     a. Delegate: delegate_to_worker(type, objective, ...)
-     b. Save outputs: artifact_tool(action='write', ...)
-     c. Update progress: planned_tasks(action='update_task', ...)
+     a. Delegate: delegate_to_worker(type, objective, ...)  
+     b. Save outputs: artifact_tool(action='write', ...)  
+     c. Update progress: planned_tasks(action='update_task', ...)  
      d. If checkpoint: ask_user for validation
    
 3. **Delivery Phase:**
@@ -255,10 +255,10 @@ You receive results as FunctionResponse:
 \`\`\`
 
 **Key Points:**
-- Use `result.data` for programmatic decisions
-- Use `result.summary` for user-facing text
-- Check `result.success` before proceeding
-- Access `result.metadata` for additional context
+- Use \`result.data\` for programmatic decisions
+- Use \`result.summary\` for user-facing text
+- Check \`result.success\` before proceeding
+- Access \`result.metadata\` for additional context
 
 ## Example Tool Usage Patterns
 
