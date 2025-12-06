@@ -1,4 +1,4 @@
-y{
+{
   "name": "Orion",
   "version": "2.0.0",
   "description": "Suna-like autonomous agent on Cloudflare Workers free-tier — real Python, POSIX workspace, zero external cost",
