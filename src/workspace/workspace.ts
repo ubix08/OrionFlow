@@ -1,19 +1,17 @@
-// src/workspace/workspace.ts - Production-Ready B2 Workspace Implementation
+// src/workspace/workspace.ts - Fixed B2 Workspace Implementation
 
 import { AwsClient } from 'aws4fetch';
 import type { Env } from '../types';
 
 /**
- * Production-ready B2 Workspace Implementation
- * Addresses all critical issues identified in review
+ * Production-Ready B2 Workspace - FIXED VERSION
  * 
  * Key Fixes:
- * - Correct endpoint construction per B2 S3 API spec
- * - Regex-based XML parsing (no DOMParser dependency)
- * - Proper AWS V4 signing with region
- * - Comprehensive error handling
- * - Path traversal protection
- * - Retry logic with exponential backoff
+ * 1. Virtual-hosted-style URLs (bucket.s3.region.backblazeb2.com)
+ * 2. Correct AWS4 signing configuration
+ * 3. Content-MD5 headers for PUT operations
+ * 4. Proper error handling for B2-specific responses
+ * 5. Fixed ListObjectsV2 parameter encoding
  */
 
 // =============================================================
@@ -21,10 +19,10 @@ import type { Env } from '../types';
 // =============================================================
 
 interface B2Config {
-  endpoint: string;     // e.g., "https://s3.us-west-004.backblazeb2.com"
-  region: string;       // e.g., "us-west-004"
-  bucket: string;       // Bucket name only
-  basePath: string;     // Optional prefix path
+  endpoint: string;     // Virtual-hosted endpoint
+  region: string;
+  bucket: string;
+  basePath: string;
 }
 
 interface ListResult {
@@ -40,17 +38,13 @@ interface B2Error {
   code: string;
   message: string;
   requestId?: string;
-  resource?: string;
 }
 
 // =============================================================
-// XML Parser (Workers-Compatible)
+// XML Parser
 // =============================================================
 
 class SimpleXMLParser {
-  /**
-   * Parse S3 ListObjectsV2 response
-   */
   static parseListObjectsV2(xml: string): {
     contents: Array<{ key: string; size: number; lastModified: string }>;
     commonPrefixes: string[];
@@ -73,44 +67,78 @@ class SimpleXMLParser {
       
       if (keyMatch && sizeMatch && lastModifiedMatch) {
         contents.push({
-          key: keyMatch[1],
+          key: this.decodeXmlEntities(keyMatch[1]),
           size: parseInt(sizeMatch[1], 10),
           lastModified: lastModifiedMatch[1]
         });
       }
     }
 
-    // Parse <CommonPrefixes> elements
+    // Parse <CommonPrefixes>
     const prefixRegex = /<CommonPrefixes>[\s\S]*?<Prefix>([^<]+)<\/Prefix>[\s\S]*?<\/CommonPrefixes>/g;
     while ((match = prefixRegex.exec(xml)) !== null) {
-      commonPrefixes.push(match[1]);
+      commonPrefixes.push(this.decodeXmlEntities(match[1]));
     }
 
-    // Parse truncation info
     const isTruncatedMatch = /<IsTruncated>(true|false)<\/IsTruncated>/.exec(xml);
     const isTruncated = isTruncatedMatch ? isTruncatedMatch[1] === 'true' : false;
     
     const nextTokenMatch = /<NextContinuationToken>([^<]+)<\/NextContinuationToken>/.exec(xml);
-    const nextContinuationToken = nextTokenMatch ? nextTokenMatch[1] : undefined;
+    const nextContinuationToken = nextTokenMatch ? this.decodeXmlEntities(nextTokenMatch[1]) : undefined;
 
     return { contents, commonPrefixes, isTruncated, nextContinuationToken };
   }
 
-  /**
-   * Parse S3 error response (XML format for 4xx errors)
-   */
   static parseError(xml: string): B2Error {
     const codeMatch = /<Code>([^<]+)<\/Code>/.exec(xml);
     const messageMatch = /<Message>([^<]+)<\/Message>/.exec(xml);
     const requestIdMatch = /<RequestId>([^<]+)<\/RequestId>/.exec(xml);
-    const resourceMatch = /<Resource>([^<]+)<\/Resource>/.exec(xml);
 
     return {
       code: codeMatch ? codeMatch[1] : 'UnknownError',
-      message: messageMatch ? messageMatch[1] : 'Unknown error occurred',
-      requestId: requestIdMatch ? requestIdMatch[1] : undefined,
-      resource: resourceMatch ? resourceMatch[1] : undefined
+      message: messageMatch ? this.decodeXmlEntities(messageMatch[1]) : 'Unknown error',
+      requestId: requestIdMatch ? requestIdMatch[1] : undefined
     };
+  }
+
+  static decodeXmlEntities(text: string): string {
+    return text
+      .replace(/&amp;/g, '&')
+      .replace(/&lt;/g, '<')
+      .replace(/&gt;/g, '>')
+      .replace(/&quot;/g, '"')
+      .replace(/&apos;/g, "'");
+  }
+
+  static encodeXmlEntities(text: string): string {
+    return text
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&apos;');
+  }
+}
+
+// =============================================================
+// MD5 Hash (for Content-MD5)
+// =============================================================
+
+class MD5 {
+  static async hash(data: string | Uint8Array): Promise<string> {
+    const bytes = typeof data === 'string' 
+      ? new TextEncoder().encode(data)
+      : data;
+    
+    const hashBuffer = await crypto.subtle.digest('MD5', bytes);
+    const hashArray = new Uint8Array(hashBuffer);
+    
+    // Convert to base64
+    let binary = '';
+    for (let i = 0; i < hashArray.length; i++) {
+      binary += String.fromCharCode(hashArray[i]);
+    }
+    return btoa(binary);
   }
 }
 
@@ -121,24 +149,32 @@ class SimpleXMLParser {
 class WorkspaceImpl {
   private s3: AwsClient;
   private config: B2Config;
+  private virtualHostedEndpoint: string;
 
   constructor(env: Env) {
-    // Extract region from endpoint
+    // Parse endpoint to extract region
     const endpointUrl = env.B2_S3_ENDPOINT as string;
     const regionMatch = /s3\.([^.]+)\.backblazeb2\.com/.exec(endpointUrl);
     
     if (!regionMatch) {
-      throw new Error(`Invalid B2 endpoint format: ${endpointUrl}. Expected: https://s3.<region>.backblazeb2.com`);
+      throw new Error(`Invalid B2 endpoint: ${endpointUrl}. Expected: https://s3.<region>.backblazeb2.com`);
     }
 
+    const region = regionMatch[1];
+    const bucket = env.B2_BUCKET as string;
+
+    // Build virtual-hosted-style endpoint
+    // Format: https://<bucket>.s3.<region>.backblazeb2.com
+    this.virtualHostedEndpoint = `https://${bucket}.s3.${region}.backblazeb2.com`;
+
     this.config = {
-      endpoint: endpointUrl.replace(/\/$/, ''),
-      region: regionMatch[1],
-      bucket: env.B2_BUCKET as string,
+      endpoint: this.virtualHostedEndpoint,
+      region,
+      bucket,
       basePath: this.normalizeBasePath(env.B2_BASE_PATH as string | undefined)
     };
 
-    // Initialize AWS client with proper config
+    // Initialize AWS client with virtual-hosted endpoint
     this.s3 = new AwsClient({
       accessKeyId: env.B2_KEY_ID as string,
       secretAccessKey: env.B2_APPLICATION_KEY as string,
@@ -147,7 +183,7 @@ class WorkspaceImpl {
     });
 
     console.log('[B2Workspace] Initialized:', {
-      endpoint: this.config.endpoint,
+      virtualHostedEndpoint: this.virtualHostedEndpoint,
       region: this.config.region,
       bucket: this.config.bucket,
       basePath: this.config.basePath
@@ -160,40 +196,32 @@ class WorkspaceImpl {
 
   private normalizeBasePath(path: string | undefined): string {
     if (!path || path.trim() === '') return '';
-    
-    // Remove leading/trailing slashes, add trailing slash
     const normalized = path.replace(/^\/+|\/+$/g, '');
     return normalized ? `${normalized}/` : '';
   }
 
   private sanitizePath(path: string): string {
-    // Remove leading slashes
     let clean = path.replace(/^\/+/, '');
     
-    // Decode URI components to catch encoded attacks
     try {
       clean = decodeURIComponent(clean);
     } catch {
-      // If decode fails, use as-is (already safe)
+      // Use as-is if decode fails
     }
     
-    // Split into parts and resolve '..' and '.'
     const parts = clean.split('/').filter(p => p && p !== '.');
     const resolved: string[] = [];
     
     for (const part of parts) {
       if (part === '..') {
-        // Remove last part (go up one level)
         resolved.pop();
       } else {
         resolved.push(part);
       }
     }
     
-    // Rejoin and ensure no dangerous patterns
     const sanitized = resolved.join('/');
     
-    // Additional security checks
     if (sanitized.includes('\0')) {
       throw new Error('Null bytes not allowed in path');
     }
@@ -206,10 +234,10 @@ class WorkspaceImpl {
     return this.config.basePath + sanitized;
   }
 
-  private buildUrl(path: string): string {
-    const fullPath = this.getFullPath(path);
-    // Correct B2 S3 API format: https://s3.<region>.backblazeb2.com/<bucket>/<key>
-    return `${this.config.endpoint}/${this.config.bucket}/${fullPath}`;
+  private buildUrl(key: string): string {
+    const fullKey = this.getFullPath(key);
+    // Virtual-hosted-style: https://<bucket>.s3.<region>.backblazeb2.com/<key>
+    return `${this.virtualHostedEndpoint}/${encodeURIComponent(fullKey).replace(/%2F/g, '/')}`;
   }
 
   // -----------------------------------------------------------
@@ -221,23 +249,20 @@ class WorkspaceImpl {
       return response;
     }
 
-    const contentType = response.headers.get('content-type') || '';
     let error: B2Error;
+    const contentType = response.headers.get('content-type') || '';
 
     try {
       if (contentType.includes('xml') || contentType.includes('text')) {
-        // 4xx errors return XML
         const xml = await response.text();
         error = SimpleXMLParser.parseError(xml);
       } else if (contentType.includes('json')) {
-        // 5xx errors return JSON
         const json = await response.json();
         error = {
           code: json.code || 'ServerError',
-          message: json.message || 'Server error occurred'
+          message: json.message || 'Server error'
         };
       } else {
-        // Fallback
         const text = await response.text();
         error = {
           code: `HTTP_${response.status}`,
@@ -251,15 +276,9 @@ class WorkspaceImpl {
       };
     }
 
-    // Enhance error message
     const errorMessage = `[B2Workspace] ${operation} failed (${response.status}): ${error.message}`;
+    console.error(errorMessage, error.requestId ? `[RequestId: ${error.requestId}]` : '');
     
-    if (error.requestId) {
-      console.error(`${errorMessage} [RequestId: ${error.requestId}]`);
-    } else {
-      console.error(errorMessage);
-    }
-
     throw new Error(errorMessage);
   }
 
@@ -273,12 +292,18 @@ class WorkspaceImpl {
     mimeType = 'application/octet-stream'
   ): Promise<void> {
     const url = this.buildUrl(path);
+    const body = typeof content === 'string' ? new TextEncoder().encode(content) : content;
+    
+    // Calculate Content-MD5 for data integrity
+    const contentMD5 = await MD5.hash(body);
     
     const response = await this.s3.fetch(url, {
       method: 'PUT',
-      body: content,
+      body,
       headers: {
-        'Content-Type': mimeType
+        'Content-Type': mimeType,
+        'Content-MD5': contentMD5,
+        'Content-Length': body.length.toString()
       }
     });
 
@@ -317,7 +342,7 @@ class WorkspaceImpl {
   }
 
   async exists(path: string): Promise<'file' | 'directory' | false> {
-    // Check as file
+    // Check as file using HEAD
     try {
       const url = this.buildUrl(path);
       const response = await this.s3.fetch(url, { method: 'HEAD' });
@@ -325,18 +350,18 @@ class WorkspaceImpl {
       if (response.ok) {
         return 'file';
       }
-    } catch {
-      // Not a file
+    } catch (err) {
+      console.debug(`[B2Workspace] exists check failed for ${path}:`, err);
     }
 
-    // Check as directory (has children)
+    // Check as directory
     try {
       const listing = await this.ls(path);
       if (listing.files.length > 0 || listing.directories.length > 0) {
         return 'directory';
       }
-    } catch {
-      // Not a directory
+    } catch (err) {
+      console.debug(`[B2Workspace] directory check failed for ${path}:`, err);
     }
 
     return false;
@@ -348,6 +373,11 @@ class WorkspaceImpl {
     const response = await this.s3.fetch(url, {
       method: 'DELETE'
     });
+
+    // B2 returns 204 No Content on successful delete
+    if (response.status === 204 || response.status === 200) {
+      return;
+    }
 
     await this.handleResponse(response, `unlink(${path})`);
   }
@@ -363,10 +393,10 @@ class WorkspaceImpl {
       }
     }
     
-    await this.write(path, existing + content);
+    await this.write(path, existing + content, 'text/plain');
   }
 
-  update = this.write; // Alias
+  update = this.write;
 
   // -----------------------------------------------------------
   // Directory Operations
@@ -381,12 +411,16 @@ class WorkspaceImpl {
     const dirPath = path.endsWith('/') ? path : `${path}/`;
     const url = this.buildUrl(dirPath);
     
+    const body = new Uint8Array(0);
+    const contentMD5 = await MD5.hash(body);
+    
     const response = await this.s3.fetch(url, {
       method: 'PUT',
-      body: new Uint8Array(0),
+      body,
       headers: {
         'Content-Length': '0',
-        'Content-Type': 'application/x-directory'
+        'Content-Type': 'application/x-directory',
+        'Content-MD5': contentMD5
       }
     });
 
@@ -395,17 +429,20 @@ class WorkspaceImpl {
 
   async ls(path: string = ''): Promise<ListResult> {
     const prefix = this.getFullPath(path);
-    const prefixWithSlash = prefix.endsWith('/') ? prefix : `${prefix}/`;
+    const prefixWithSlash = prefix && !prefix.endsWith('/') ? `${prefix}/` : prefix;
     
-    // Build ListObjectsV2 URL
-    const baseUrl = `${this.config.endpoint}/${this.config.bucket}`;
+    // Build query parameters
     const params = new URLSearchParams({
       'list-type': '2',
       'delimiter': '/',
-      'prefix': prefixWithSlash
+      'max-keys': '1000'
     });
     
-    const url = `${baseUrl}?${params.toString()}`;
+    if (prefixWithSlash) {
+      params.set('prefix', prefixWithSlash);
+    }
+    
+    const url = `${this.virtualHostedEndpoint}?${params.toString()}`;
     
     const response = await this.s3.fetch(url, {
       method: 'GET'
@@ -416,27 +453,26 @@ class WorkspaceImpl {
     const xml = await response.text();
     const parsed = SimpleXMLParser.parseListObjectsV2(xml);
 
-    // Process results
     const directories: string[] = [];
     const files: Array<{ name: string; size: number; modified: Date }> = [];
 
-    // Extract directory names (remove prefix and trailing slash)
+    // Extract directory names
     for (const prefix of parsed.commonPrefixes) {
       let dirName = prefix.slice(prefixWithSlash.length);
       if (dirName.endsWith('/')) {
         dirName = dirName.slice(0, -1);
       }
-      if (dirName) {
+      if (dirName && !dirName.includes('/')) {
         directories.push(dirName);
       }
     }
 
-    // Extract file names (remove prefix)
+    // Extract file names
     for (const item of parsed.contents) {
       const fileName = item.key.slice(prefixWithSlash.length);
       
-      // Skip directory markers and empty names
-      if (fileName && !fileName.endsWith('/')) {
+      // Skip directory markers, empty names, and nested paths
+      if (fileName && !fileName.endsWith('/') && !fileName.includes('/')) {
         files.push({
           name: fileName,
           size: item.size,
@@ -456,22 +492,22 @@ class WorkspaceImpl {
     const prefix = this.getFullPath(path);
     const prefixWithSlash = prefix.endsWith('/') ? prefix : `${prefix}/`;
 
-    // List all objects under prefix
     let continuationToken: string | undefined;
     const keysToDelete: string[] = [];
 
+    // List all objects
     do {
-      const baseUrl = `${this.config.endpoint}/${this.config.bucket}`;
       const params = new URLSearchParams({
         'list-type': '2',
-        'prefix': prefixWithSlash
+        'prefix': prefixWithSlash,
+        'max-keys': '1000'
       });
       
       if (continuationToken) {
         params.set('continuation-token', continuationToken);
       }
 
-      const listUrl = `${baseUrl}?${params.toString()}`;
+      const listUrl = `${this.virtualHostedEndpoint}?${params.toString()}`;
       const response = await this.s3.fetch(listUrl, { method: 'GET' });
       await this.handleResponse(response, `rm-list(${path})`);
 
@@ -485,7 +521,7 @@ class WorkspaceImpl {
       
     } while (continuationToken);
 
-    // Delete objects in batches of 1000 (S3 limit)
+    // Delete in batches
     const batchSize = 1000;
     for (let i = 0; i < keysToDelete.length; i += batchSize) {
       const batch = keysToDelete.slice(i, i + batchSize);
@@ -498,34 +534,29 @@ class WorkspaceImpl {
   private async deleteBatch(keys: string[]): Promise<void> {
     if (keys.length === 0) return;
 
-    // Build DeleteObjects XML
     const deleteXml = [
+      '<?xml version="1.0" encoding="UTF-8"?>',
       '<Delete>',
-      ...keys.map(key => `<Object><Key>${this.escapeXml(key)}</Key></Object>`),
+      ...keys.map(key => `<Object><Key>${SimpleXMLParser.encodeXmlEntities(key)}</Key></Object>`),
       '<Quiet>true</Quiet>',
       '</Delete>'
     ].join('');
 
-    const url = `${this.config.endpoint}/${this.config.bucket}?delete`;
+    const body = new TextEncoder().encode(deleteXml);
+    const contentMD5 = await MD5.hash(body);
+    
+    const url = `${this.virtualHostedEndpoint}?delete`;
     
     const response = await this.s3.fetch(url, {
       method: 'POST',
-      body: deleteXml,
+      body,
       headers: {
-        'Content-Type': 'application/xml'
+        'Content-Type': 'application/xml',
+        'Content-MD5': contentMD5
       }
     });
 
     await this.handleResponse(response, 'deleteBatch');
-  }
-
-  private escapeXml(text: string): string {
-    return text
-      .replace(/&/g, '&amp;')
-      .replace(/</g, '&lt;')
-      .replace(/>/g, '&gt;')
-      .replace(/"/g, '&quot;')
-      .replace(/'/g, '&apos;');
   }
 
   // -----------------------------------------------------------
@@ -534,7 +565,8 @@ class WorkspaceImpl {
 
   async createDirectoryStructure(base: string, dirs: string[]): Promise<void> {
     for (const dir of dirs) {
-      await this.mkdir(`${base}/${dir}`);
+      const path = base ? `${base}/${dir}` : dir;
+      await this.mkdir(path);
     }
   }
 
@@ -599,6 +631,11 @@ class WorkspaceSingleton {
   static async exists(path: string) {
     if (!this.instance) throw new Error('Workspace not initialized');
     return this.instance.exists(path);
+  }
+
+  static async rm(path: string) {
+    if (!this.instance) throw new Error('Workspace not initialized');
+    return this.instance.rm(path);
   }
 
   static async createDirectoryStructure(base: string, dirs: string[]): Promise<void> {
