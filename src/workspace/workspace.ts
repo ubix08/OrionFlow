@@ -1,26 +1,7 @@
-// src/workspace/workspace.ts - Production-Ready B2 Workspace Implementation
-// Based on official Backblaze B2 S3-Compatible API documentation (2024)
+// src/workspace/workspace.ts - Enhanced B2 Workspace with Retry & Error Handling
 
 import { AwsClient } from 'aws4fetch';
 import type { Env } from '../types';
-
-/**
- * Production-ready B2 Workspace Implementation
- * 
- * Official B2 S3 API Documentation:
- * - Endpoint format: https://s3.<region>.backblazeb2.com
- * - Region format: us-west-004, us-west-001, etc.
- * - Authentication: AWS Signature V4 only
- * - Bucket operations: https://s3.<region>.backblazeb2.com/<bucket-name>
- * 
- * Key Features:
- * - Correct endpoint construction per B2 S3 API spec
- * - Regex-based XML parsing (no DOMParser dependency)
- * - Proper AWS V4 signing with region
- * - Comprehensive error handling
- * - Path traversal protection
- * - Retry logic with exponential backoff
- */
 
 // =============================================================
 // Types
@@ -39,6 +20,7 @@ interface ListResult {
     name: string;
     size: number;
     modified: Date;
+    etag?: string;
   }>;
 }
 
@@ -49,18 +31,25 @@ interface B2Error {
   resource?: string;
 }
 
+interface RetryOptions {
+  maxAttempts?: number;
+  initialDelayMs?: number;
+  maxDelayMs?: number;
+  backoffMultiplier?: number;
+}
+
 // =============================================================
 // XML Parser (Workers-Compatible)
 // =============================================================
 
 class SimpleXMLParser {
   static parseListObjectsV2(xml: string): {
-    contents: Array<{ key: string; size: number; lastModified: string }>;
+    contents: Array<{ key: string; size: number; lastModified: string; etag?: string }>;
     commonPrefixes: string[];
     isTruncated: boolean;
     nextContinuationToken?: string;
   } {
-    const contents: Array<{ key: string; size: number; lastModified: string }> = [];
+    const contents: Array<{ key: string; size: number; lastModified: string; etag?: string }> = [];
     const commonPrefixes: string[] = [];
 
     // Parse <Contents> blocks
@@ -73,12 +62,14 @@ class SimpleXMLParser {
       const keyMatch = /<Key>([^<]+)<\/Key>/.exec(contentBlock);
       const sizeMatch = /<Size>(\d+)<\/Size>/.exec(contentBlock);
       const lastModifiedMatch = /<LastModified>([^<]+)<\/LastModified>/.exec(contentBlock);
+      const etagMatch = /<ETag>"?([^<"]+)"?<\/ETag>/.exec(contentBlock);
       
       if (keyMatch && sizeMatch && lastModifiedMatch) {
         contents.push({
           key: keyMatch[1],
           size: parseInt(sizeMatch[1], 10),
-          lastModified: lastModifiedMatch[1]
+          lastModified: lastModifiedMatch[1],
+          etag: etagMatch ? etagMatch[1] : undefined
         });
       }
     }
@@ -115,6 +106,62 @@ class SimpleXMLParser {
 }
 
 // =============================================================
+// Retry Logic with Exponential Backoff
+// =============================================================
+
+class RetryHelper {
+  static async withRetry<T>(
+    operation: () => Promise<T>,
+    options: RetryOptions = {}
+  ): Promise<T> {
+    const {
+      maxAttempts = 3,
+      initialDelayMs = 1000,
+      maxDelayMs = 10000,
+      backoffMultiplier = 2
+    } = options;
+
+    let lastError: Error | undefined;
+    let delay = initialDelayMs;
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        return await operation();
+      } catch (error) {
+        lastError = error instanceof Error ? error : new Error(String(error));
+        
+        // Don't retry on certain errors
+        if (this.isNonRetryableError(lastError)) {
+          throw lastError;
+        }
+
+        if (attempt < maxAttempts) {
+          console.warn(`[RetryHelper] Attempt ${attempt} failed, retrying in ${delay}ms:`, lastError.message);
+          await this.sleep(delay);
+          delay = Math.min(delay * backoffMultiplier, maxDelayMs);
+        }
+      }
+    }
+
+    throw lastError || new Error('Operation failed after retries');
+  }
+
+  private static isNonRetryableError(error: Error): boolean {
+    const message = error.message.toLowerCase();
+    // Don't retry on client errors (4xx except 429)
+    const nonRetryable = [
+      '400', '401', '403', '404', '405', '409', '410', '422'
+    ];
+    
+    return nonRetryable.some(code => message.includes(code));
+  }
+
+  private static sleep(ms: number): Promise<void> {
+    return new Promise(resolve => setTimeout(resolve, ms));
+  }
+}
+
+// =============================================================
 // B2 Workspace Implementation
 // =============================================================
 
@@ -123,22 +170,18 @@ class WorkspaceImpl {
   private config: B2Config;
 
   constructor(env: Env) {
-    // Validate environment variables
     this.validateEnvironment(env);
 
-    // Parse endpoint to extract region
     const endpointUrl = String(env.B2_S3_ENDPOINT).trim();
     const region = this.extractRegion(endpointUrl);
 
-    // Build configuration
     this.config = {
-      endpoint: endpointUrl.replace(/\/$/, ''), // Remove trailing slash
+      endpoint: endpointUrl.replace(/\/$/, ''),
       region,
       bucket: String(env.B2_BUCKET).trim(),
       basePath: this.normalizeBasePath(env.B2_BASE_PATH as string | undefined)
     };
 
-    // Initialize AWS S3 client with B2 credentials
     this.s3 = new AwsClient({
       accessKeyId: String(env.B2_KEY_ID).trim(),
       secretAccessKey: String(env.B2_APPLICATION_KEY).trim(),
@@ -146,20 +189,16 @@ class WorkspaceImpl {
       region: this.config.region
     });
 
-    console.log('[B2Workspace] Initialized successfully:', {
+    console.log('[B2Workspace] Initialized:', {
       endpoint: this.config.endpoint,
       region: this.config.region,
       bucket: this.config.bucket,
       basePath: this.config.basePath || '(root)'
     });
 
-    // Validate URL construction
     this.validateUrlConstruction();
   }
 
-  /**
-   * Validate all required environment variables
-   */
   private validateEnvironment(env: Env): void {
     const required = [
       { key: 'B2_KEY_ID', value: env.B2_KEY_ID },
@@ -171,97 +210,73 @@ class WorkspaceImpl {
     const missing = required.filter(r => !r.value || String(r.value).trim() === '');
     
     if (missing.length > 0) {
-      const missingKeys = missing.map(m => m.key).join(', ');
-      throw new Error(`Missing required B2 environment variables: ${missingKeys}`);
+      throw new Error(`Missing B2 environment variables: ${missing.map(m => m.key).join(', ')}`);
     }
 
-    // Validate endpoint format
     const endpoint = String(env.B2_S3_ENDPOINT).trim();
     if (!endpoint.startsWith('http://') && !endpoint.startsWith('https://')) {
       throw new Error(
-        `B2_S3_ENDPOINT must start with http:// or https://. Got: "${endpoint}". ` +
-        `Expected format: https://s3.<region>.backblazeb2.com`
+        `B2_S3_ENDPOINT must start with http:// or https://. ` +
+        `Expected: https://s3.<region>.backblazeb2.com`
       );
     }
 
-    // Validate endpoint structure
     if (!endpoint.includes('.backblazeb2.com')) {
       throw new Error(
-        `B2_S3_ENDPOINT appears invalid. Got: "${endpoint}". ` +
-        `Expected format: https://s3.<region>.backblazeb2.com (e.g., https://s3.us-west-004.backblazeb2.com)`
+        `B2_S3_ENDPOINT appears invalid. ` +
+        `Expected format: https://s3.<region>.backblazeb2.com`
       );
     }
   }
 
-  /**
-   * Extract region from B2 S3 endpoint
-   * Format: https://s3.<region>.backblazeb2.com
-   * Example: https://s3.us-west-004.backblazeb2.com -> us-west-004
-   */
   private extractRegion(endpoint: string): string {
-    // Match pattern: s3.<region>.backblazeb2.com
     const regionMatch = /s3\.([^.]+)\.backblazeb2\.com/.exec(endpoint);
     
     if (!regionMatch) {
       throw new Error(
         `Cannot extract region from B2_S3_ENDPOINT: "${endpoint}". ` +
-        `Expected format: https://s3.<region>.backblazeb2.com (e.g., https://s3.us-west-004.backblazeb2.com)`
+        `Expected format: https://s3.<region>.backblazeb2.com`
       );
     }
 
-    const region = regionMatch[1];
-    console.log(`[B2Workspace] Extracted region: ${region}`);
-    return region;
+    return regionMatch[1];
   }
 
-  /**
-   * Normalize base path (optional workspace root prefix)
-   */
   private normalizeBasePath(path: string | undefined): string {
     if (!path || path.trim() === '') return '';
-    const normalized = path.replace(/^\/+|\/+$/g, ''); // Remove leading/trailing slashes
+    const normalized = path.replace(/^\/+|\/+$/g, '');
     return normalized ? `${normalized}/` : '';
   }
 
-  /**
-   * Validate that URL construction works
-   */
   private validateUrlConstruction(): void {
     try {
       const testPath = 'test/file.txt';
       const testUrl = this.buildUrl(testPath);
-      new URL(testUrl); // Will throw if invalid
-      console.log('[B2Workspace] URL validation passed');
+      new URL(testUrl);
     } catch (error) {
       throw new Error(
-        `B2 configuration validation failed - cannot construct valid URLs: ${
+        `B2 configuration validation failed: ${
           error instanceof Error ? error.message : String(error)
         }`
       );
     }
   }
 
-  /**
-   * Sanitize path to prevent traversal attacks
-   */
   private sanitizePath(path: string): string {
-    // Remove leading slashes
     let clean = path.replace(/^\/+/, '');
     
-    // Decode URL encoding if present
     try {
       clean = decodeURIComponent(clean);
     } catch {
-      // If decode fails, use as-is
+      // Use as-is if decode fails
     }
     
-    // Split and resolve path components
     const parts = clean.split('/').filter(p => p && p !== '.');
     const resolved: string[] = [];
     
     for (const part of parts) {
       if (part === '..') {
-        resolved.pop(); // Go up one level
+        resolved.pop();
       } else {
         resolved.push(part);
       }
@@ -269,7 +284,6 @@ class WorkspaceImpl {
     
     const sanitized = resolved.join('/');
     
-    // Security check: no null bytes
     if (sanitized.includes('\0')) {
       throw new Error('Null bytes not allowed in path');
     }
@@ -277,51 +291,24 @@ class WorkspaceImpl {
     return sanitized;
   }
 
-  /**
-   * Get full path including base path prefix
-   */
   private getFullPath(path: string): string {
     const sanitized = this.sanitizePath(path);
     return this.config.basePath + sanitized;
   }
 
-  /**
-   * Build complete B2 S3 URL
-   * Format: https://s3.<region>.backblazeb2.com/<bucket>/<path>
-   */
   private buildUrl(path: string): string {
     const fullPath = this.getFullPath(path);
-    
-    // URL-encode path segments (but not slashes)
-    const encodedPath = fullPath.split('/').map(segment => encodeURIComponent(segment)).join('/');
-    
-    // Construct URL per B2 S3 API spec
+    const encodedPath = fullPath.split('/').map(s => encodeURIComponent(s)).join('/');
     const url = `${this.config.endpoint}/${this.config.bucket}/${encodedPath}`;
     
-    // Validate URL format
     try {
       new URL(url);
       return url;
     } catch (error) {
-      console.error('[B2Workspace] Invalid URL construction:', {
-        endpoint: this.config.endpoint,
-        bucket: this.config.bucket,
-        path,
-        fullPath,
-        encodedPath,
-        resultUrl: url
-      });
-      throw new Error(
-        `Failed to construct valid B2 URL for path "${path}": ${
-          error instanceof Error ? error.message : String(error)
-        }`
-      );
+      throw new Error(`Failed to construct valid B2 URL for path "${path}"`);
     }
   }
 
-  /**
-   * Handle HTTP response and parse errors
-   */
   private async handleResponse(response: Response, operation: string): Promise<Response> {
     if (response.ok) {
       return response;
@@ -347,7 +334,7 @@ class WorkspaceImpl {
           message: text || response.statusText
         };
       }
-    } catch (parseError) {
+    } catch {
       error = {
         code: `HTTP_${response.status}`,
         message: response.statusText
@@ -355,88 +342,70 @@ class WorkspaceImpl {
     }
 
     const errorMessage = `[B2Workspace] ${operation} failed (${response.status}): ${error.message}`;
-    
-    if (error.requestId) {
-      console.error(`${errorMessage} [RequestId: ${error.requestId}]`);
-    } else {
-      console.error(errorMessage);
-    }
-
+    console.error(errorMessage);
     throw new Error(errorMessage);
   }
 
   // =============================================================
-  // Public API Methods
+  // Public API Methods with Retry Logic
   // =============================================================
 
-  /**
-   * Write file to B2
-   */
   async write(
     path: string,
     content: string | Uint8Array,
     mimeType = 'application/octet-stream'
-  ): Promise<void> {
-    const url = this.buildUrl(path);
-    
-    console.log(`[B2Workspace] Writing file: ${path}`);
-    
-    const response = await this.s3.fetch(url, {
-      method: 'PUT',
-      body: content,
-      headers: {
-        'Content-Type': mimeType
-      }
-    });
+  ): Promise<{ etag?: string }> {
+    return RetryHelper.withRetry(async () => {
+      const url = this.buildUrl(path);
+      
+      const response = await this.s3.fetch(url, {
+        method: 'PUT',
+        body: content,
+        headers: {
+          'Content-Type': mimeType
+        }
+      });
 
-    await this.handleResponse(response, `write(${path})`);
-    console.log(`[B2Workspace] ✅ File written: ${path}`);
+      await this.handleResponse(response, `write(${path})`);
+      
+      const etag = response.headers.get('etag')?.replace(/"/g, '');
+      console.log(`[B2Workspace] ✅ Wrote: ${path} (${typeof content === 'string' ? content.length : content.byteLength} bytes)`);
+      
+      return { etag };
+    }, { maxAttempts: 3 });
   }
 
-  /**
-   * Read file as text
-   */
   async read(path: string): Promise<string> {
-    const url = this.buildUrl(path);
-    
-    console.log(`[B2Workspace] Reading file: ${path}`);
-    
-    const response = await this.s3.fetch(url, {
-      method: 'GET'
-    });
+    return RetryHelper.withRetry(async () => {
+      const url = this.buildUrl(path);
+      
+      const response = await this.s3.fetch(url, { method: 'GET' });
 
-    if (response.status === 404) {
-      throw new Error(`File not found: ${path}`);
-    }
+      if (response.status === 404) {
+        throw new Error(`File not found: ${path}`);
+      }
 
-    await this.handleResponse(response, `read(${path})`);
-    return await response.text();
+      await this.handleResponse(response, `read(${path})`);
+      return await response.text();
+    }, { maxAttempts: 3 });
   }
 
-  /**
-   * Read file as bytes
-   */
   async readBytes(path: string): Promise<Uint8Array> {
-    const url = this.buildUrl(path);
-    
-    console.log(`[B2Workspace] Reading file (bytes): ${path}`);
-    
-    const response = await this.s3.fetch(url, {
-      method: 'GET'
-    });
+    return RetryHelper.withRetry(async () => {
+      const url = this.buildUrl(path);
+      
+      const response = await this.s3.fetch(url, { method: 'GET' });
 
-    if (response.status === 404) {
-      throw new Error(`File not found: ${path}`);
-    }
+      if (response.status === 404) {
+        throw new Error(`File not found: ${path}`);
+      }
 
-    await this.handleResponse(response, `readBytes(${path})`);
-    const buffer = await response.arrayBuffer();
-    return new Uint8Array(buffer);
+      await this.handleResponse(response, `readBytes(${path})`);
+      const buffer = await response.arrayBuffer();
+      return new Uint8Array(buffer);
+    }, { maxAttempts: 3 });
   }
 
-  /**
-   * Check if path exists (file or directory)
-   */
   async exists(path: string): Promise<'file' | 'directory' | false> {
     // Try as file first (HEAD request)
     try {
@@ -444,7 +413,6 @@ class WorkspaceImpl {
       const response = await this.s3.fetch(url, { method: 'HEAD' });
       
       if (response.ok) {
-        console.log(`[B2Workspace] Path exists as file: ${path}`);
         return 'file';
       }
     } catch {
@@ -455,36 +423,26 @@ class WorkspaceImpl {
     try {
       const listing = await this.ls(path);
       if (listing.files.length > 0 || listing.directories.length > 0) {
-        console.log(`[B2Workspace] Path exists as directory: ${path}`);
         return 'directory';
       }
     } catch {
       // Not a directory
     }
 
-    console.log(`[B2Workspace] Path does not exist: ${path}`);
     return false;
   }
 
-  /**
-   * Delete file
-   */
   async unlink(path: string): Promise<void> {
-    const url = this.buildUrl(path);
-    
-    console.log(`[B2Workspace] Deleting file: ${path}`);
-    
-    const response = await this.s3.fetch(url, {
-      method: 'DELETE'
-    });
-
-    await this.handleResponse(response, `unlink(${path})`);
-    console.log(`[B2Workspace] ✅ File deleted: ${path}`);
+    return RetryHelper.withRetry(async () => {
+      const url = this.buildUrl(path);
+      
+      const response = await this.s3.fetch(url, { method: 'DELETE' });
+      await this.handleResponse(response, `unlink(${path})`);
+      
+      console.log(`[B2Workspace] ✅ Deleted: ${path}`);
+    }, { maxAttempts: 2 }); // Fewer retries for DELETE
   }
 
-  /**
-   * Append content to file
-   */
   async append(path: string, content: string): Promise<void> {
     let existing = '';
     
@@ -499,25 +457,14 @@ class WorkspaceImpl {
     await this.write(path, existing + content);
   }
 
-  /**
-   * Alias for write
-   */
-  update = this.write;
-
-  /**
-   * Create directory (marker object)
-   * In B2/S3, directories are simulated with zero-byte objects ending in /
-   */
   async mkdir(path: string): Promise<void> {
     if (!path.trim()) {
       throw new Error('Path cannot be empty');
     }
 
-    try {
+    return RetryHelper.withRetry(async () => {
       const dirPath = path.endsWith('/') ? path : `${path}/`;
       const url = this.buildUrl(dirPath);
-      
-      console.log(`[B2Workspace] Creating directory: ${path} -> ${url}`);
       
       const response = await this.s3.fetch(url, {
         method: 'PUT',
@@ -529,78 +476,64 @@ class WorkspaceImpl {
       });
 
       await this.handleResponse(response, `mkdir(${path})`);
-      console.log(`[B2Workspace] ✅ Directory created: ${path}`);
-    } catch (error) {
-      console.error(`[B2Workspace] mkdir failed for path: ${path}`, error);
-      throw error;
-    }
+      console.log(`[B2Workspace] ✅ Created directory: ${path}`);
+    }, { maxAttempts: 3 });
   }
 
-  /**
-   * List directory contents
-   * Uses S3 ListObjectsV2 with delimiter to simulate directories
-   */
   async ls(path: string = ''): Promise<ListResult> {
-    const prefix = this.getFullPath(path);
-    const prefixWithSlash = prefix && !prefix.endsWith('/') ? `${prefix}/` : prefix;
-    
-    // Build ListObjectsV2 URL
-    const baseUrl = `${this.config.endpoint}/${this.config.bucket}`;
-    const params = new URLSearchParams({
-      'list-type': '2',
-      'delimiter': '/',
-      'prefix': prefixWithSlash
-    });
-    
-    const url = `${baseUrl}?${params.toString()}`;
-    
-    console.log(`[B2Workspace] Listing directory: ${path}`);
-    
-    const response = await this.s3.fetch(url, {
-      method: 'GET'
-    });
-
-    await this.handleResponse(response, `ls(${path})`);
-    
-    const xml = await response.text();
-    const parsed = SimpleXMLParser.parseListObjectsV2(xml);
-
-    const directories: string[] = [];
-    const files: Array<{ name: string; size: number; modified: Date }> = [];
-
-    // Process common prefixes (directories)
-    for (const prefix of parsed.commonPrefixes) {
-      let dirName = prefix.slice(prefixWithSlash.length);
-      if (dirName.endsWith('/')) {
-        dirName = dirName.slice(0, -1);
-      }
-      if (dirName) {
-        directories.push(dirName);
-      }
-    }
-
-    // Process contents (files)
-    for (const item of parsed.contents) {
-      const fileName = item.key.slice(prefixWithSlash.length);
+    return RetryHelper.withRetry(async () => {
+      const prefix = this.getFullPath(path);
+      const prefixWithSlash = prefix && !prefix.endsWith('/') ? `${prefix}/` : prefix;
       
-      // Skip directory markers and empty names
-      if (fileName && !fileName.endsWith('/')) {
-        files.push({
-          name: fileName,
-          size: item.size,
-          modified: new Date(item.lastModified)
-        });
+      const baseUrl = `${this.config.endpoint}/${this.config.bucket}`;
+      const params = new URLSearchParams({
+        'list-type': '2',
+        'delimiter': '/',
+        'prefix': prefixWithSlash,
+        'max-keys': '1000' // B2 supports up to 1000
+      });
+      
+      const url = `${baseUrl}?${params.toString()}`;
+      
+      const response = await this.s3.fetch(url, { method: 'GET' });
+      await this.handleResponse(response, `ls(${path})`);
+      
+      const xml = await response.text();
+      const parsed = SimpleXMLParser.parseListObjectsV2(xml);
+
+      const directories: string[] = [];
+      const files: Array<{ name: string; size: number; modified: Date; etag?: string }> = [];
+
+      // Process common prefixes (directories)
+      for (const prefix of parsed.commonPrefixes) {
+        let dirName = prefix.slice(prefixWithSlash.length);
+        if (dirName.endsWith('/')) {
+          dirName = dirName.slice(0, -1);
+        }
+        if (dirName) {
+          directories.push(dirName);
+        }
       }
-    }
 
-    console.log(`[B2Workspace] ✅ Listed: ${directories.length} directories, ${files.length} files`);
+      // Process contents (files)
+      for (const item of parsed.contents) {
+        const fileName = item.key.slice(prefixWithSlash.length);
+        
+        if (fileName && !fileName.endsWith('/')) {
+          files.push({
+            name: fileName,
+            size: item.size,
+            modified: new Date(item.lastModified),
+            etag: item.etag
+          });
+        }
+      }
 
-    return { directories, files };
+      console.log(`[B2Workspace] ✅ Listed: ${directories.length} dirs, ${files.length} files`);
+      return { directories, files };
+    }, { maxAttempts: 3 });
   }
 
-  /**
-   * Recursively delete directory
-   */
   async rm(path: string): Promise<void> {
     if (!path.trim()) {
       throw new Error('Cannot delete workspace root');
@@ -640,7 +573,7 @@ class WorkspaceImpl {
       
     } while (continuationToken);
 
-    // Delete in batches of 1000 (B2 limit)
+    // Delete in batches
     const batchSize = 1000;
     for (let i = 0; i < keysToDelete.length; i += batchSize) {
       const batch = keysToDelete.slice(i, i + batchSize);
@@ -650,9 +583,6 @@ class WorkspaceImpl {
     console.log(`[B2Workspace] ✅ Deleted ${keysToDelete.length} objects from ${path}`);
   }
 
-  /**
-   * Delete multiple objects in batch
-   */
   private async deleteBatch(keys: string[]): Promise<void> {
     if (keys.length === 0) return;
 
@@ -676,9 +606,6 @@ class WorkspaceImpl {
     await this.handleResponse(response, 'deleteBatch');
   }
 
-  /**
-   * Escape XML special characters
-   */
   private escapeXml(text: string): string {
     return text
       .replace(/&/g, '&amp;')
@@ -688,18 +615,12 @@ class WorkspaceImpl {
       .replace(/'/g, '&apos;');
   }
 
-  /**
-   * Create multiple directories at once
-   */
   async createDirectoryStructure(base: string, dirs: string[]): Promise<void> {
     for (const dir of dirs) {
       await this.mkdir(`${base}/${dir}`);
     }
   }
 
-  /**
-   * Get current configuration
-   */
   getConfig(): B2Config {
     return { ...this.config };
   }
@@ -779,6 +700,5 @@ class WorkspaceClass {
   }
 }
 
-// Export as both named and default
 export const Workspace = WorkspaceClass;
 export default WorkspaceClass;
