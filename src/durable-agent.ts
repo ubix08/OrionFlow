@@ -804,7 +804,7 @@ Present final results and prepare for next task.
     }
     return '';
   }
-  
+
   private async saveMessage(role: 'user' | 'model', content: string): Promise<void> {
     await this.storage.saveMessage(role, [{ text: content }], Date.now());
   }
@@ -835,34 +835,4 @@ Present final results and prepare for next task.
   }
 }
 
-export default OrionAgent;], Date.now());
-  }
-
-  private async syncToD1(): Promise<void> {
-    if (!this.d1 || !this.sessionId) return;
-    
-    try {
-      const messages = this.storage.getMessages();
-      if (messages.length === 0) return;
-      
-      const latestInD1 = await this.d1.getLatestMessageTimestamp(this.sessionId);
-      const newMessages = messages.filter(m => (m.timestamp || 0) > latestInD1);
-      
-      if (newMessages.length > 0) {
-        await this.d1.saveMessages(this.sessionId, newMessages);
-        console.log(`[AgentV2] ✅ Synced ${newMessages.length} messages to D1`);
-      }
-      
-      const artifacts = this.storage.getArtifacts();
-      for (const artifact of artifacts) {
-        await this.d1.saveArtifact(this.sessionId, artifact);
-      }
-    } catch (err) {
-      console.error('[AgentV2] D1 sync failed:', err);
-      throw err;
-    }
-  }
-}
-
 export default OrionAgent;
-    
