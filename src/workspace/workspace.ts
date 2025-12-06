@@ -354,8 +354,8 @@ class WorkspaceImpl {
     path: string,
     content: string | Uint8Array,
     mimeType = 'application/octet-stream'
-  ): Promise<{ etag?: string }> {
-    return RetryHelper.withRetry(async () => {
+  ): Promise<void> {
+    await RetryHelper.withRetry(async () => {
       const url = this.buildUrl(path);
       
       const response = await this.s3.fetch(url, {
@@ -369,9 +369,8 @@ class WorkspaceImpl {
       await this.handleResponse(response, `write(${path})`);
       
       const etag = response.headers.get('etag')?.replace(/"/g, '');
-      console.log(`[B2Workspace] ✅ Wrote: ${path} (${typeof content === 'string' ? content.length : content.byteLength} bytes)`);
-      
-      return { etag };
+      const size = typeof content === 'string' ? content.length : content.byteLength;
+      console.log(`[B2Workspace] ✅ Wrote: ${path} (${size} bytes)${etag ? ` [ETag: ${etag}]` : ''}`);
     }, { maxAttempts: 3 });
   }
 
