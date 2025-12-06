@@ -180,12 +180,21 @@ export class PlannedTasksTool implements AdminTool {
 
     // Write files using Workspace singleton
     try {
+      console.log('[PlannedTasks] Writing description.md');
       await Workspace.writeFile(`${taskPath}/description.md`, args.description, 'text/markdown');
+      
+      console.log('[PlannedTasks] Writing metadata.json');
       await Workspace.writeFile(`${taskPath}/metadata.json`, JSON.stringify(metadata, null, 2), 'application/json');
+      
+      console.log('[PlannedTasks] Writing todo.json');
       await Workspace.writeFile(`${taskPath}/todo.json`, JSON.stringify(todo, null, 2), 'application/json');
       
+      // Create human-readable plan
       const planMarkdown = this.generatePlanMarkdown(todo);
+      console.log('[PlannedTasks] Writing plan.md');
       await Workspace.writeFile(`${taskPath}/plan.md`, planMarkdown, 'text/markdown');
+      
+      console.log('[PlannedTasks] ✅ All task files written successfully');
     } catch (writeError) {
       console.error('[PlannedTasks] Failed to write task files:', writeError);
       throw new Error(`Failed to write task files: ${writeError instanceof Error ? writeError.message : String(writeError)}`);
