@@ -121,12 +121,13 @@ export class OrionAgent extends DurableObject implements OrionRPC {
       this.workspaceEnabled = false;
     }
     
-    // Initialize core components
+    // Initialize core components (AFTER workspace initialization)
     this.workerFactory = new WorkerFactory(this.gemini);
     this.toolRegistry = new AdminToolRegistry(
       this.gemini,
       this.memory || null,
-      this.workerFactory
+      this.workerFactory,
+      this.workspaceEnabled  // CRITICAL: Pass workspace status to tools
     );
     this.phaseManager = new PhaseManager('discovery');
     
