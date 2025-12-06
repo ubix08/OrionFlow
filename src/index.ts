@@ -1,8 +1,7 @@
-// src/index.ts - Worker Entry Point with Feature Flag and Diagnostics
+// src/index-v2.ts - Worker Entry Point (Fixed)
 
 import { OrionAgent } from './durable-agent';
 import { D1Manager } from './storage/d1-manager';
-import { WorkspaceDiagnostics } from './workspace/diagnostics';
 import type { Env, OrionRPC } from './types';
 import type { DurableObjectStub } from '@cloudflare/workers-types';
 
@@ -36,77 +35,7 @@ function isValidSessionId(sessionId: string): boolean {
 }
 
 // =============================================================
-// Health Check with Diagnostics
-// =============================================================
-
-async function handleHealthCheck(
-  request: Request,
-  env: Env,
-  ctx: ExecutionContext
-): Promise<Response> {
-  const url = new URL(request.url);
-  const detailed = url.searchParams.get('detailed') === 'true';
-  
-  const useV2 = env.ENABLE_ADMIN_WORKER_ARCH === 'true';
-  
-  let d1Status = { enabled: false, healthy: false };
-  if (env.DB) {
-    const d1 = new D1Manager(env.DB);
-    d1Status = {
-      enabled: true,
-      healthy: await d1.healthCheck(),
-    };
-  }
-
-  const basicHealth = {
-    status: 'ok',
-    name: 'ORION AI-Collaborator',
-    version: '2.0.0',
-    architecture: useV2 ? 'Admin-Worker (v2)' : 'Conversational (v1)',
-    timestamp: new Date().toISOString(),
-    d1: d1Status,
-    featureFlags: {
-      adminWorkerArch: useV2
-    }
-  };
-
-  if (!detailed) {
-    return jsonResponse(basicHealth);
-  }
-
-  try {
-    const diagnostics = new WorkspaceDiagnostics(env);
-    const result = await diagnostics.runAll();
-    
-    return jsonResponse({
-      ...basicHealth,
-      workspace: {
-        configured: !!(
-          env.B2_KEY_ID &&
-          env.B2_APPLICATION_KEY &&
-          env.B2_S3_ENDPOINT &&
-          env.B2_BUCKET
-        ),
-        diagnostics: {
-          success: result.success,
-          summary: result.summary,
-          results: result.results
-        }
-      }
-    });
-  } catch (error) {
-    return jsonResponse({
-      ...basicHealth,
-      workspace: {
-        configured: false,
-        error: error instanceof Error ? error.message : String(error)
-      }
-    }, 500);
-  }
-}
-
-// =============================================================
-// RPC Routing with Architecture Selection
+// RPC Routing (Fixed for AGENT_V2)
 // =============================================================
 
 async function routeToRPC(
@@ -125,12 +54,12 @@ async function routeToRPC(
   }
 
   try {
-    const useV2 = env.ENABLE_ADMIN_WORKER_ARCH === 'true';
-    const agentType = useV2 ? 'AGENT' : 'AGENT';
-    
-    const id = env[agentType as keyof Env].idFromName(`session:${sessionId}`);
-    const stub = env[agentType as keyof Env].get(id) as DurableObjectStub<OrionRPC>;
+    // ✅ FIXED: Use AGENT instead of AGENT_V2
+    // The Durable Object binding name in wrangler.toml is 'AGENT'
+    const id = env.AGENT.idFromName(`session:${sessionId}`);
+    const stub = env.AGENT.get(id) as DurableObjectStub<OrionRPC>;
 
+    // Ensure session exists in D1
     if (env.DB) {
       const d1 = new D1Manager(env.DB);
       const existing = await d1.getSession(sessionId);
@@ -208,16 +137,6 @@ async function routeToRPC(
           return jsonResponse(result);
         }
         break;
-
-      case '/api/execute-step':
-      case '/api/workflows':
-      case '/api/workflows/search':
-      case '/api/workflows/create-project':
-      case '/api/projects':
-        if (useV2) {
-          return errorResponse('This endpoint is not available in v2 architecture', 404);
-        }
-        break;
     }
 
     return new Response('Not Found', { status: 404 });
@@ -228,7 +147,7 @@ async function routeToRPC(
 }
 
 // =============================================================
-// WebSocket Routing
+// WebSocket Routing (Fixed)
 // =============================================================
 
 async function routeToWebSocket(
@@ -243,12 +162,11 @@ async function routeToWebSocket(
   }
 
   try {
-    const useV2 = env.ENABLE_ADMIN_WORKER_ARCH === 'true';
-    const agentType = useV2 ? 'AGENT' : 'AGENT';
-    
-    const id = env[agentType as keyof Env].idFromName(`session:${sessionId}`);
-    const stub = env[agentType as keyof Env].get(id);
+    // ✅ FIXED: Use AGENT binding
+    const id = env.AGENT.idFromName(`session:${sessionId}`);
+    const stub = env.AGENT.get(id);
 
+    // Ensure session in D1
     if (env.DB) {
       const d1 = new D1Manager(env.DB);
       const existing = await d1.getSession(sessionId);
@@ -277,6 +195,7 @@ export default {
     const url = new URL(request.url);
     const path = url.pathname;
 
+    // CORS
     const corsHeaders = {
       'Access-Control-Allow-Origin': '*',
       'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
@@ -288,15 +207,52 @@ export default {
     }
 
     try {
+      // Health check
       if (path === '/' || path === '/health') {
-        return await handleHealthCheck(request, env, ctx);
+        let d1Status = { enabled: false, healthy: false };
+        if (env.DB) {
+          const d1 = new D1Manager(env.DB);
+          d1Status = {
+            enabled: true,
+            healthy: await d1.healthCheck(),
+          };
+        }
+
+        // Check B2 configuration
+        const b2Status = {
+          configured: !!(
+            env.B2_KEY_ID &&
+            env.B2_APPLICATION_KEY &&
+            env.B2_S3_ENDPOINT &&
+            env.B2_BUCKET
+          ),
+          details: {
+            hasKeyId: !!env.B2_KEY_ID,
+            hasAppKey: !!env.B2_APPLICATION_KEY,
+            hasEndpoint: !!env.B2_S3_ENDPOINT,
+            hasBucket: !!env.B2_BUCKET,
+            hasBasePath: !!env.B2_BASE_PATH
+          }
+        };
+
+        return jsonResponse({
+          status: 'ok',
+          name: 'ORION AI-Collaborator',
+          version: '2.1.0',
+          architecture: 'Admin-Worker v2',
+          d1: d1Status,
+          workspace: b2Status,
+          timestamp: new Date().toISOString()
+        });
       }
 
+      // WebSocket upgrade
       const upgradeHeader = request.headers.get('Upgrade');
       if (upgradeHeader?.toLowerCase() === 'websocket') {
         return await routeToWebSocket(request, env, ctx);
       }
 
+      // API routes
       if (path.startsWith('/api/')) {
         return await routeToRPC(request, env, ctx);
       }
