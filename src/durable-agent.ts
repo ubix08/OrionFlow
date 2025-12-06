@@ -1,4 +1,4 @@
-// src/durable-agent-v2.ts - Refactored Admin-Worker Architecture with Phase Management
+// src/durable-agent-v2.ts - Refactored with Workspace Initialization Fix
 
 import { DurableObject } from 'cloudflare:workers';
 import type { DurableObjectState } from '@cloudflare/workers-types';
@@ -21,6 +21,7 @@ import { buildAdminSystemPrompt } from './prompts/admin-system-prompt';
 import { WorkerFactory } from './workers/specialized-workers';
 import { AdminToolRegistry } from './tools-v2/tool-registry';
 import { PhaseManager, type ConversationPhase } from './core/phase-manager';
+import { Workspace } from './workspace/workspace';
 import type { ToolResult } from './tools-v2/tool-types';
 
 /**
@@ -30,6 +31,7 @@ import type { ToolResult } from './tools-v2/tool-types';
  * - Admin Agent: Orchestration via function calling
  * - Worker Agents: Execution via native tools
  * - Phase Manager: Explicit conversation state machine
+ * - B2 Workspace: Persistent file storage
  * - Clear separation of concerns
  */
 export class OrionAgent extends DurableObject implements OrionRPC {
@@ -41,6 +43,7 @@ export class OrionAgent extends DurableObject implements OrionRPC {
   private memory?: MemoryManager;
   private sessionId?: string;
   private initialized = false;
+  private workspaceEnabled = false;
   
   private workerFactory!: WorkerFactory;
   private toolRegistry!: AdminToolRegistry;
@@ -77,10 +80,12 @@ export class OrionAgent extends DurableObject implements OrionRPC {
   private async init(): Promise<void> {
     if (this.initialized) return;
     
+    // Initialize D1
     if (this.env.DB) {
       this.d1 = new D1Manager(this.env.DB);
     }
     
+    // Initialize Memory (Vectorize)
     if (this.sessionId) {
       if (this.env.VECTORIZE) {
         this.memory = new MemoryManager(
@@ -101,6 +106,21 @@ export class OrionAgent extends DurableObject implements OrionRPC {
       await this.storage.setAlarm(Date.now() + 300000);
     }
     
+    // ===== CRITICAL FIX: Initialize B2 Workspace =====
+    if (this.isWorkspaceConfigured()) {
+      try {
+        Workspace.initialize(this.env);
+        this.workspaceEnabled = true;
+        console.log('[AgentV2] ✅ B2 Workspace initialized successfully');
+      } catch (error) {
+        console.error('[AgentV2] ❌ B2 Workspace initialization failed:', error);
+        this.workspaceEnabled = false;
+      }
+    } else {
+      console.warn('[AgentV2] ⚠️  B2 Workspace not configured (missing env vars)');
+      this.workspaceEnabled = false;
+    }
+    
     // Initialize core components
     this.workerFactory = new WorkerFactory(this.gemini);
     this.toolRegistry = new AdminToolRegistry(
@@ -111,7 +131,23 @@ export class OrionAgent extends DurableObject implements OrionRPC {
     this.phaseManager = new PhaseManager('discovery');
     
     this.initialized = true;
-    console.log('[AgentV2] Initialized with Admin-Worker architecture');
+    console.log('[AgentV2] Initialized with Admin-Worker architecture', {
+      workspace: this.workspaceEnabled ? 'enabled' : 'disabled',
+      memory: this.memory ? 'enabled' : 'disabled',
+      d1: this.d1 ? 'enabled' : 'disabled'
+    });
+  }
+
+  /**
+   * Check if B2 workspace environment variables are configured
+   */
+  private isWorkspaceConfigured(): boolean {
+    return !!(
+      this.env.B2_KEY_ID &&
+      this.env.B2_APPLICATION_KEY &&
+      this.env.B2_S3_ENDPOINT &&
+      this.env.B2_BUCKET
+    );
   }
 
   private async hydrateFromD1(): Promise<void> {
@@ -240,8 +276,9 @@ export class OrionAgent extends DurableObject implements OrionRPC {
       },
       memory: this.memory ? this.memory.getMetrics() : null,
       workspace: { 
-        enabled: this.env.B2_KEY_ID !== undefined,
-        initialized: true 
+        enabled: this.workspaceEnabled,
+        initialized: Workspace.isInitialized(),
+        configured: this.isWorkspaceConfigured()
       },
       availableWorkflows: 0,
       activeProject: phaseContext.activeTaskId ? {
@@ -529,37 +566,49 @@ export class OrionAgent extends DurableObject implements OrionRPC {
   private buildPhaseAwareSystemPrompt(phase: ConversationPhase): string {
     const basePrompt = this.adminSystemPrompt;
     
+    const workspaceStatus = this.workspaceEnabled 
+      ? 'WORKSPACE: ✅ Available - Use planned_tasks and artifact_tool for persistent storage'
+      : 'WORKSPACE: ❌ Not available - Task management disabled';
+    
     const phaseGuidance: Record<ConversationPhase, string> = {
       discovery: `
 CURRENT PHASE: DISCOVERY
+${workspaceStatus}
 Focus on understanding user intent and gathering context.
 - Use web_search for quick lookups
 - Use rag_search to find similar past tasks
 - Use ask_user to clarify requirements
 - For simple tasks: delegate directly
-- For complex tasks: transition to planning with planned_tasks(new_task)
+- For complex tasks: ${this.workspaceEnabled ? 'transition to planning with planned_tasks(new_task)' : 'break down into steps and execute'}
 `,
       planning: `
 CURRENT PHASE: PLANNING
+${workspaceStatus}
 Create structured task plans with clear steps.
+${this.workspaceEnabled ? `
 - Use rag_search(sources=['tasks']) to find similar task templates
 - Create todo.json with planned_tasks(new_task)
 - Break down into clear, delegatable steps
 - Assign appropriate worker types to each step
 - Once plan is ready: transition to execution
+` : 'Note: Workspace unavailable - provide planning guidance to user'}
 `,
       execution: `
 CURRENT PHASE: EXECUTION
+${workspaceStatus}
 Execute task steps systematically via workers.
+${this.workspaceEnabled ? `
 - Load active task with planned_tasks(load_task)
 - Delegate current step with delegate_to_worker
 - Save artifacts with artifact_tool(write)
 - Update progress with planned_tasks(update_task)
 - After each step: transition to review if checkpoint
 - When all steps complete: transition to delivery
+` : 'Execute tasks in conversation without persistent storage'}
 `,
       review: `
 CURRENT PHASE: REVIEW
+${workspaceStatus}
 Validate step outputs and gather user feedback.
 - Present step results clearly
 - Use ask_user for validation if needed
@@ -568,6 +617,7 @@ Validate step outputs and gather user feedback.
 `,
       delivery: `
 CURRENT PHASE: DELIVERY
+${workspaceStatus}
 Present final results and prepare for next task.
 - Summarize all outputs and artifacts
 - Highlight key achievements
