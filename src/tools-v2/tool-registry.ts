@@ -1,9 +1,8 @@
-// src/tools-v2/tool-registry.ts - Enhanced Admin Tool Registry (FIXED)
+// src/tools-v2/tool-registry.ts - FIXED: Type imports and workspace handling
 
 import type { GeminiClient } from '../gemini';
 import type { MemoryManager } from '../memory/memory-manager';
 import type { WorkerFactory } from '../workers/specialized-workers';
-import type { WorkspaceImpl } from '../workspace/workspace';
 import type { AdminTool, ToolResult, FunctionDeclaration } from './tool-types';
 import {
   WebSearchTool,
@@ -20,9 +19,10 @@ import { ArtifactTool } from './artifact-tool';
  * Central registry for all admin tools (FIXED)
  * 
  * FIXES APPLIED:
- * ✅ Dependency injection for workspace (no singleton)
- * ✅ Workspace availability passed to tools that need it
- * ✅ Clear separation of tool registration and initialization
+ * ✅ Removed WorkspaceImpl type import (doesn't exist)
+ * ✅ Tools use Workspace singleton directly via static methods
+ * ✅ Workspace parameter is optional and informational only
+ * ✅ Clear documentation of workspace access pattern
  */
 export class AdminToolRegistry {
   private tools = new Map<string, AdminTool>();
@@ -31,16 +31,15 @@ export class AdminToolRegistry {
     gemini: GeminiClient,
     memory: MemoryManager | null,
     workerFactory: WorkerFactory,
-    workspace: WorkspaceImpl | null // NEW: Explicit dependency injection
+    _workspace: null = null // Workspace handled via singleton, parameter kept for API compatibility
   ) {
-    this.registerTools(gemini, memory, workerFactory, workspace);
+    this.registerTools(gemini, memory, workerFactory);
   }
   
   private registerTools(
     gemini: GeminiClient,
     memory: MemoryManager | null,
-    workerFactory: WorkerFactory,
-    workspace: WorkspaceImpl | null
+    workerFactory: WorkerFactory
   ): void {
     // Core information gathering tools
     this.tools.set('web_search', new WebSearchTool(gemini));
@@ -54,11 +53,13 @@ export class AdminToolRegistry {
     // Enhanced RAG search across multiple sources
     this.tools.set('rag_search', new RAGSearchTool(gemini, memory));
     
-    // Task management system (with workspace dependency)
-    this.tools.set('planned_tasks', new PlannedTasksTool(workspace));
+    // Task management system
+    // NOTE: PlannedTasksTool uses Workspace singleton directly
+    this.tools.set('planned_tasks', new PlannedTasksTool());
     
-    // Artifact lifecycle management (with workspace dependency)
-    this.tools.set('artifact_tool', new ArtifactTool(workspace));
+    // Artifact lifecycle management
+    // NOTE: ArtifactTool uses Workspace singleton directly
+    this.tools.set('artifact_tool', new ArtifactTool());
     
     // Worker delegation
     this.tools.set('delegate_to_worker', new DelegateTool(workerFactory));
@@ -66,11 +67,7 @@ export class AdminToolRegistry {
     // User interaction
     this.tools.set('ask_user', new AskUserTool());
     
-    const workspaceStatus = workspace ? 'enabled' : 'disabled';
-    console.log(
-      `[ToolRegistry] Registered ${this.tools.size} admin tools ` +
-      `(workspace: ${workspaceStatus})`
-    );
+    console.log(`[ToolRegistry] Registered ${this.tools.size} admin tools`);
   }
   
   /**
@@ -82,7 +79,6 @@ export class AdminToolRegistry {
   
   /**
    * Execute a tool by name with arguments
-   * Returns structured ToolResult with typed data
    */
   async executeTool(name: string, args: any): Promise<ToolResult> {
     const tool = this.tools.get(name);
@@ -122,7 +118,7 @@ export class AdminToolRegistry {
   }
   
   /**
-   * Check if a tool requires user input (ask_user)
+   * Check if a tool requires user input
    */
   isUserInputRequired(toolName: string, result: ToolResult): boolean {
     return toolName === 'ask_user' || result.metadata?.requiresUserInput === true;
