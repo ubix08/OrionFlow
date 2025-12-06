@@ -1,4 +1,4 @@
-// src/tools-v2/planned-tasks-tool.ts - Task Management System (FIXED)
+// src/tools-v2/planned-tasks-tool.ts - Task Management System
 
 import { Workspace } from '../workspace/workspace';
 import type {
@@ -67,18 +67,12 @@ export class PlannedTasksTool implements AdminTool {
     stepStatus?: TodoStep['status'];
     stepOutput?: string;
   }): Promise<ToolResult> {
-    // FIXED: Better workspace availability check with helpful error message
     if (!Workspace.isInitialized()) {
-      console.error('[PlannedTasks] Workspace not initialized - check B2 configuration');
       return {
         success: false,
         data: null,
-        summary: 'Task management is not available. The workspace requires B2 storage configuration with the following environment variables: B2_KEY_ID, B2_APPLICATION_KEY, B2_S3_ENDPOINT, and B2_BUCKET. Please configure these and restart the service.',
-        metadata: { 
-          error: 'WORKSPACE_NOT_AVAILABLE',
-          required_env_vars: ['B2_KEY_ID', 'B2_APPLICATION_KEY', 'B2_S3_ENDPOINT', 'B2_BUCKET'],
-          hint: 'Check your .dev.vars file or wrangler.toml configuration'
-        }
+        summary: 'Workspace not initialized. Cannot manage tasks.',
+        metadata: { error: 'WORKSPACE_NOT_AVAILABLE' }
       };
     }
 
@@ -101,53 +95,14 @@ export class PlannedTasksTool implements AdminTool {
       }
     } catch (error) {
       console.error('[PlannedTasks] Error:', error);
-      
-      // Provide more helpful error messages
-      const errorMessage = error instanceof Error ? error.message : String(error);
-      
-      // Check for common B2 errors
-      if (errorMessage.includes('403') || errorMessage.includes('Forbidden')) {
-        return {
-          success: false,
-          data: null,
-          summary: 'Task operation failed due to B2 permission error. Please verify your B2_APPLICATION_KEY has read/write permissions for the bucket.',
-          metadata: { 
-            error: 'B2_PERMISSION_DENIED',
-            originalError: errorMessage
-          }
-        };
-      }
-      
-      if (errorMessage.includes('404') || errorMessage.includes('Not Found')) {
-        return {
-          success: false,
-          data: null,
-          summary: 'Task operation failed: Resource not found. This may indicate the B2 bucket does not exist or the task was deleted.',
-          metadata: { 
-            error: 'RESOURCE_NOT_FOUND',
-            originalError: errorMessage
-          }
-        };
-      }
-      
-      if (errorMessage.includes('endpoint') || errorMessage.includes('region')) {
-        return {
-          success: false,
-          data: null,
-          summary: 'Task operation failed due to B2 endpoint configuration error. Please verify B2_S3_ENDPOINT is in the format: https://s3.<region>.backblazeb2.com',
-          metadata: { 
-            error: 'B2_ENDPOINT_ERROR',
-            originalError: errorMessage
-          }
-        };
-      }
-      
-      // Generic error
       return {
         success: false,
         data: null,
-        summary: `Task operation failed: ${errorMessage}`,
-        metadata: { error: 'OPERATION_FAILED', details: errorMessage }
+        summary: `Task operation failed: ${error instanceof Error ? error.message : String(error)}`,
+        metadata: { 
+          error: 'OPERATION_FAILED',
+          errorDetails: error instanceof Error ? error.message : String(error)
+        }
       };
     }
   }
@@ -169,73 +124,92 @@ export class PlannedTasksTool implements AdminTool {
       };
     }
 
+    console.log('[PlannedTasks] Creating new task:', args.title);
+
     // Generate task ID and folder name
     const taskId = `task_${Date.now()}_${this.slugify(args.title)}`;
     const taskPath = `tasks/${taskId}`;
 
-    try {
-      // Create directory structure
-      console.log(`[PlannedTasks] Creating task directories: ${taskPath}`);
-      await Workspace.mkdir(taskPath);
-      await Workspace.mkdir(`${taskPath}/artifacts`);
-      await Workspace.mkdir(`${taskPath}/checkpoints`);
+    console.log('[PlannedTasks] Task path:', taskPath);
 
-      // Create metadata
-      const metadata = {
-        taskId,
-        title: args.title,
-        status: 'pending',
+    // Create directory structure
+    try {
+      console.log('[PlannedTasks] Creating directory:', taskPath);
+      await Workspace.mkdir(taskPath);
+      
+      console.log('[PlannedTasks] Creating artifacts directory');
+      await Workspace.mkdir(`${taskPath}/artifacts`);
+      
+      console.log('[PlannedTasks] Creating checkpoints directory');
+      await Workspace.mkdir(`${taskPath}/checkpoints`);
+    } catch (mkdirError) {
+      console.error('[PlannedTasks] Failed to create directories:', mkdirError);
+      throw new Error(`Failed to create task directories: ${mkdirError instanceof Error ? mkdirError.message : String(mkdirError)}`);
+    }
+
+    // Create metadata
+    const metadata = {
+      taskId,
+      title: args.title,
+      status: 'pending',
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      tags: args.todo.metadata?.tags || []
+    };
+
+    // Create todo structure
+    const todo: TodoStructure = {
+      taskId,
+      title: args.title,
+      description: args.description,
+      status: 'pending',
+      steps: args.todo.steps || [],
+      metadata: {
         createdAt: Date.now(),
         updatedAt: Date.now(),
         tags: args.todo.metadata?.tags || []
-      };
+      }
+    };
 
-      // Create todo structure
-      const todo: TodoStructure = {
-        taskId,
-        title: args.title,
-        description: args.description,
-        status: 'pending',
-        steps: args.todo.steps || [],
-        metadata: {
-          createdAt: Date.now(),
-          updatedAt: Date.now(),
-          tags: args.todo.metadata?.tags || []
-        }
-      };
-
-      // Write files
-      console.log(`[PlannedTasks] Writing task files...`);
-      await Workspace.writeFile(`${taskPath}/description.md`, args.description);
-      await Workspace.writeFile(`${taskPath}/metadata.json`, JSON.stringify(metadata, null, 2));
-      await Workspace.writeFile(`${taskPath}/todo.json`, JSON.stringify(todo, null, 2));
+    // Write files
+    try {
+      console.log('[PlannedTasks] Writing description.md');
+      await Workspace.writeFile(`${taskPath}/description.md`, args.description, 'text/markdown');
+      
+      console.log('[PlannedTasks] Writing metadata.json');
+      await Workspace.writeFile(`${taskPath}/metadata.json`, JSON.stringify(metadata, null, 2), 'application/json');
+      
+      console.log('[PlannedTasks] Writing todo.json');
+      await Workspace.writeFile(`${taskPath}/todo.json`, JSON.stringify(todo, null, 2), 'application/json');
       
       // Create human-readable plan
       const planMarkdown = this.generatePlanMarkdown(todo);
-      await Workspace.writeFile(`${taskPath}/plan.md`, planMarkdown);
-
-      console.log(`[PlannedTasks] ✅ Created task: ${taskId} with ${todo.steps.length} steps`);
-
-      return {
-        success: true,
-        data: {
-          taskId,
-          taskPath,
-          todo,
-          metadata
-        },
-        summary: `Created new task: ${args.title} (${taskId}) with ${todo.steps.length} steps`,
-        metadata: {
-          taskId,
-          taskPath,
-          stepCount: todo.steps.length,
-          action: 'new_task'
-        }
-      };
-    } catch (error) {
-      console.error(`[PlannedTasks] Failed to create task:`, error);
-      throw error; // Let the main execute() handler provide user-friendly error
+      console.log('[PlannedTasks] Writing plan.md');
+      await Workspace.writeFile(`${taskPath}/plan.md`, planMarkdown, 'text/markdown');
+    } catch (writeError) {
+      console.error('[PlannedTasks] Failed to write task files:', writeError);
+      throw new Error(`Failed to write task files: ${writeError instanceof Error ? writeError.message : String(writeError)}`);
     }
+
+    console.log(`[PlannedTasks] ✅ Created task: ${taskId}`);
+
+    return {
+      success: true,
+      data: {
+        taskId,
+        taskPath,
+        todo,
+        metadata,
+        action: 'new_task'
+      },
+      summary: `Created new task: ${args.title} (${taskId}) with ${todo.steps.length} steps`,
+      metadata: {
+        action: 'new_task',
+        taskId,
+        taskPath,
+        stepCount: todo.steps.length
+      }
+    };
   }
 
   // -----------------------------------------------------------
@@ -253,24 +227,26 @@ export class PlannedTasksTool implements AdminTool {
       };
     }
 
+    console.log('[PlannedTasks] Loading task:', args.taskId);
+
+    // Find task folder (search by ID)
+    const tasksDir = await Workspace.readdir('tasks');
+    const taskFolder = tasksDir.directories.find(d => d.includes(args.taskId!));
+
+    if (!taskFolder) {
+      return {
+        success: false,
+        data: null,
+        summary: `Task not found: ${args.taskId}`
+      };
+    }
+
+    const taskPath = `tasks/${taskFolder}`;
+
+    // Load task files
     try {
-      // Find task folder (search by ID)
-      console.log(`[PlannedTasks] Loading task: ${args.taskId}`);
-      const tasksDir = await Workspace.readdir('tasks');
-      const taskFolder = tasksDir.directories.find(d => d.includes(args.taskId!));
-
-      if (!taskFolder) {
-        return {
-          success: false,
-          data: null,
-          summary: `Task not found: ${args.taskId}. Use list_tasks to see available tasks.`,
-          metadata: { error: 'TASK_NOT_FOUND', taskId: args.taskId }
-        };
-      }
-
-      const taskPath = `tasks/${taskFolder}`;
-
-      // Load task files
+      console.log('[PlannedTasks] Reading task files from:', taskPath);
+      
       const description = await Workspace.readFileText(`${taskPath}/description.md`);
       const metadataStr = await Workspace.readFileText(`${taskPath}/metadata.json`);
       const todoStr = await Workspace.readFileText(`${taskPath}/todo.json`);
@@ -286,7 +262,7 @@ export class PlannedTasksTool implements AdminTool {
         modified: f.modified
       }));
 
-      console.log(`[PlannedTasks] ✅ Loaded task: ${args.taskId} (${todo.steps.length} steps, ${artifacts.length} artifacts)`);
+      console.log(`[PlannedTasks] ✅ Loaded task: ${args.taskId}`);
 
       return {
         success: true,
@@ -296,20 +272,25 @@ export class PlannedTasksTool implements AdminTool {
           description,
           metadata,
           todo,
-          artifacts
+          artifacts,
+          action: 'load_task'
         },
         summary: `Loaded task: ${metadata.title} (${todo.steps.length} steps, ${artifacts.length} artifacts)`,
         metadata: {
+          action: 'load_task',
           taskId: args.taskId,
           stepCount: todo.steps.length,
           artifactCount: artifacts.length,
-          status: todo.status,
-          action: 'load_task'
+          status: todo.status
         }
       };
-    } catch (error) {
-      console.error(`[PlannedTasks] Failed to load task:`, error);
-      throw error;
+    } catch (readError) {
+      console.error('[PlannedTasks] Failed to read task files:', readError);
+      return {
+        success: false,
+        data: null,
+        summary: `Failed to load task: ${readError instanceof Error ? readError.message : String(readError)}`
+      };
     }
   }
 
@@ -331,24 +312,24 @@ export class PlannedTasksTool implements AdminTool {
       };
     }
 
+    console.log('[PlannedTasks] Updating task:', args.taskId, 'step:', args.stepNumber);
+
+    // Find task folder
+    const tasksDir = await Workspace.readdir('tasks');
+    const taskFolder = tasksDir.directories.find(d => d.includes(args.taskId!));
+
+    if (!taskFolder) {
+      return {
+        success: false,
+        data: null,
+        summary: `Task not found: ${args.taskId}`
+      };
+    }
+
+    const taskPath = `tasks/${taskFolder}`;
+
+    // Load current todo
     try {
-      // Find task folder
-      console.log(`[PlannedTasks] Updating task: ${args.taskId}`);
-      const tasksDir = await Workspace.readdir('tasks');
-      const taskFolder = tasksDir.directories.find(d => d.includes(args.taskId!));
-
-      if (!taskFolder) {
-        return {
-          success: false,
-          data: null,
-          summary: `Task not found: ${args.taskId}`,
-          metadata: { error: 'TASK_NOT_FOUND', taskId: args.taskId }
-        };
-      }
-
-      const taskPath = `tasks/${taskFolder}`;
-
-      // Load current todo
       const todoStr = await Workspace.readFileText(`${taskPath}/todo.json`);
       const todo: TodoStructure = JSON.parse(todoStr);
 
@@ -360,8 +341,7 @@ export class PlannedTasksTool implements AdminTool {
           return {
             success: false,
             data: null,
-            summary: `Step ${args.stepNumber} not found in task. Available steps: ${todo.steps.map(s => s.number).join(', ')}`,
-            metadata: { error: 'STEP_NOT_FOUND', availableSteps: todo.steps.map(s => s.number) }
+            summary: `Step ${args.stepNumber} not found in task`
           };
         }
 
@@ -381,6 +361,8 @@ export class PlannedTasksTool implements AdminTool {
         if (args.stepOutput) {
           step.notes = args.stepOutput;
         }
+
+        console.log(`[PlannedTasks] Updated step ${args.stepNumber}: ${args.stepStatus}`);
       }
 
       // Update task status based on steps
@@ -402,14 +384,14 @@ export class PlannedTasksTool implements AdminTool {
       todo.metadata.updatedAt = Date.now();
 
       // Save updated todo
-      await Workspace.writeFile(`${taskPath}/todo.json`, JSON.stringify(todo, null, 2));
+      await Workspace.writeFile(`${taskPath}/todo.json`, JSON.stringify(todo, null, 2), 'application/json');
 
       // Update metadata file
       const metadataStr = await Workspace.readFileText(`${taskPath}/metadata.json`);
       const metadata = JSON.parse(metadataStr);
       metadata.status = todo.status;
       metadata.updatedAt = Date.now();
-      await Workspace.writeFile(`${taskPath}/metadata.json`, JSON.stringify(metadata, null, 2));
+      await Workspace.writeFile(`${taskPath}/metadata.json`, JSON.stringify(metadata, null, 2), 'application/json');
 
       // Create checkpoint
       const checkpointPath = `${taskPath}/checkpoints/checkpoint_${Date.now()}.json`;
@@ -418,28 +400,33 @@ export class PlannedTasksTool implements AdminTool {
         todo,
         stepNumber: args.stepNumber,
         action: 'update'
-      }, null, 2));
+      }, null, 2), 'application/json');
 
-      console.log(`[PlannedTasks] ✅ Updated task: ${args.taskId}, step ${args.stepNumber} -> ${args.stepStatus}`);
+      console.log(`[PlannedTasks] ✅ Updated task: ${args.taskId}`);
 
       return {
         success: true,
         data: {
           taskId: args.taskId,
           todo,
-          updatedStep: args.stepNumber
+          updatedStep: args.stepNumber,
+          action: 'update_task'
         },
-        summary: `Updated task ${args.taskId}: step ${args.stepNumber} -> ${args.stepStatus}. Task status: ${todo.status}`,
+        summary: `Updated task ${args.taskId}: step ${args.stepNumber} -> ${args.stepStatus}`,
         metadata: {
+          action: 'update_task',
           taskStatus: todo.status,
           stepNumber: args.stepNumber,
-          checkpointCreated: true,
-          action: 'update_task'
+          checkpointCreated: true
         }
       };
-    } catch (error) {
-      console.error(`[PlannedTasks] Failed to update task:`, error);
-      throw error;
+    } catch (updateError) {
+      console.error('[PlannedTasks] Failed to update task:', updateError);
+      return {
+        success: false,
+        data: null,
+        summary: `Failed to update task: ${updateError instanceof Error ? updateError.message : String(updateError)}`
+      };
     }
   }
 
@@ -448,8 +435,9 @@ export class PlannedTasksTool implements AdminTool {
   // -----------------------------------------------------------
 
   private async listTasks(): Promise<ToolResult> {
+    console.log('[PlannedTasks] Listing all tasks');
+
     try {
-      console.log(`[PlannedTasks] Listing all tasks...`);
       const tasksDir = await Workspace.readdir('tasks');
       const tasks: any[] = [];
 
@@ -459,7 +447,7 @@ export class PlannedTasksTool implements AdminTool {
           const metadata = JSON.parse(metadataStr);
           tasks.push(metadata);
         } catch (error) {
-          console.warn(`[PlannedTasks] Failed to read task: ${taskFolder}`, error);
+          console.warn(`[PlannedTasks] Failed to read task: ${taskFolder}`);
         }
       }
 
@@ -470,17 +458,21 @@ export class PlannedTasksTool implements AdminTool {
 
       return {
         success: true,
-        data: { tasks },
-        summary: `Found ${tasks.length} tasks. Status breakdown: ${JSON.stringify(this.groupByStatus(tasks))}`,
+        data: { tasks, action: 'list_tasks' },
+        summary: `Found ${tasks.length} tasks`,
         metadata: {
+          action: 'list_tasks',
           totalTasks: tasks.length,
-          byStatus: this.groupByStatus(tasks),
-          action: 'list_tasks'
+          byStatus: this.groupByStatus(tasks)
         }
       };
-    } catch (error) {
-      console.error(`[PlannedTasks] Failed to list tasks:`, error);
-      throw error;
+    } catch (listError) {
+      console.error('[PlannedTasks] Failed to list tasks:', listError);
+      return {
+        success: false,
+        data: { tasks: [] },
+        summary: `Failed to list tasks: ${listError instanceof Error ? listError.message : String(listError)}`
+      };
     }
   }
 
