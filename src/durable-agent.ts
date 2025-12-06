@@ -1,4 +1,4 @@
-// src/durable-agent-v2.ts - Refactored Admin-Worker Architecture
+// src/durable-agent-v2.ts - Refactored Admin-Worker Architecture with Phase Management
 
 import { DurableObject } from 'cloudflare:workers';
 import type { DurableObjectState } from '@cloudflare/workers-types';
@@ -20,6 +20,7 @@ import { MemoryManager } from './memory/memory-manager';
 import { buildAdminSystemPrompt } from './prompts/admin-system-prompt';
 import { WorkerFactory } from './workers/specialized-workers';
 import { AdminToolRegistry } from './tools-v2/tool-registry';
+import { PhaseManager, type ConversationPhase } from './core/phase-manager';
 import type { ToolResult } from './tools-v2/tool-types';
 
 /**
@@ -28,6 +29,7 @@ import type { ToolResult } from './tools-v2/tool-types';
  * Architecture:
  * - Admin Agent: Orchestration via function calling
  * - Worker Agents: Execution via native tools
+ * - Phase Manager: Explicit conversation state machine
  * - Clear separation of concerns
  */
 export class OrionAgent extends DurableObject implements OrionRPC {
@@ -42,6 +44,7 @@ export class OrionAgent extends DurableObject implements OrionRPC {
   
   private workerFactory!: WorkerFactory;
   private toolRegistry!: AdminToolRegistry;
+  private phaseManager!: PhaseManager;
   private adminSystemPrompt: string;
   
   private metrics = {
@@ -50,6 +53,7 @@ export class OrionAgent extends DurableObject implements OrionRPC {
     workerDelegations: 0,
     toolCalls: 0,
     totalTokens: 0,
+    phaseTransitions: 0,
   };
 
   constructor(state: DurableObjectState, env: Env) {
@@ -97,13 +101,14 @@ export class OrionAgent extends DurableObject implements OrionRPC {
       await this.storage.setAlarm(Date.now() + 300000);
     }
     
-    // Initialize workers and tools
+    // Initialize core components
     this.workerFactory = new WorkerFactory(this.gemini);
     this.toolRegistry = new AdminToolRegistry(
       this.gemini,
       this.memory || null,
       this.workerFactory
     );
+    this.phaseManager = new PhaseManager('discovery');
     
     this.initialized = true;
     console.log('[AgentV2] Initialized with Admin-Worker architecture');
@@ -186,6 +191,7 @@ export class OrionAgent extends DurableObject implements OrionRPC {
     await this.init();
     await this.storage.clearAll();
     if (this.memory) await this.memory.clearSessionMemory();
+    this.phaseManager = new PhaseManager('discovery'); // Reset phase
     return { ok: true };
   }
 
@@ -214,13 +220,18 @@ export class OrionAgent extends DurableObject implements OrionRPC {
   async getStatus(): Promise<StatusResponse> {
     await this.init();
     
+    const phaseContext = this.phaseManager.getContext();
+    
     return {
       sessionId: this.sessionId,
       messageCount: this.storage.getMessages().length,
       artifactCount: this.storage.getArtifacts().length,
-      conversationPhase: 'discovery',
-      protocol: 'Admin-Worker Architecture v2.0',
-      metrics: this.metrics as any,
+      conversationPhase: phaseContext.currentPhase,
+      protocol: 'Admin-Worker Architecture v2.1',
+      metrics: {
+        ...this.metrics,
+        phaseTransitions: phaseContext.history.length
+      } as any,
       nativeTools: {
         googleSearch: false, // Admin doesn't use native tools
         codeExecution: false,
@@ -228,12 +239,23 @@ export class OrionAgent extends DurableObject implements OrionRPC {
         thinking: true,
       },
       memory: this.memory ? this.memory.getMetrics() : null,
-      workspace: { enabled: false, initialized: false },
+      workspace: { 
+        enabled: this.env.B2_KEY_ID !== undefined,
+        initialized: true 
+      },
       availableWorkflows: 0,
+      activeProject: phaseContext.activeTaskId ? {
+        projectId: phaseContext.activeTaskId,
+        projectPath: `tasks/${phaseContext.activeTaskId}`,
+        currentStep: phaseContext.currentStepNumber || 0,
+        totalSteps: 0, // Would need to load from todo.json
+        createdAt: Date.now(),
+        updatedAt: Date.now()
+      } : undefined
     } as StatusResponse;
   }
 
-  // Placeholder implementations for backward compatibility
+  // Placeholder implementations
   async executeStep(): Promise<any> {
     throw new Error('executeStep not implemented in v2 architecture');
   }
@@ -340,7 +362,7 @@ export class OrionAgent extends DurableObject implements OrionRPC {
   }
 
   // =============================================================
-  // Core Admin Loop (Function Calling)
+  // Core Admin Loop with Phase Management
   // =============================================================
 
   private async executeAdminLoop(
@@ -363,9 +385,14 @@ export class OrionAgent extends DurableObject implements OrionRPC {
       // Save user message
       await this.saveMessage('user', userMessage);
       
-      // Build conversation context
+      // Get current phase context
+      const currentPhase = this.phaseManager.getCurrentPhase();
+      callbacks?.onStatus?.(`Phase: ${currentPhase}`);
+      
+      // Build conversation context with phase awareness
+      const systemPrompt = this.buildPhaseAwareSystemPrompt(currentPhase);
       const messages: Array<{ role: string; content: string }> = [
-        { role: 'system', content: this.adminSystemPrompt },
+        { role: 'system', content: systemPrompt },
         ...this.formatContextForGemini(this.storage.getMessages().slice(-10)),
         { role: 'user', content: userMessage }
       ];
@@ -384,7 +411,6 @@ export class OrionAgent extends DurableObject implements OrionRPC {
             stream: true,
             temperature: 0.8,
             thinkingConfig: { thinkingBudget: 8192, includeThoughts: true },
-            // NO native tools for admin
             useSearch: false,
             useCodeExecution: false,
             maxOutputTokens: 8192,
@@ -417,6 +443,9 @@ export class OrionAgent extends DurableObject implements OrionRPC {
             
             toolResults.push({ name: toolCall.name, result });
             
+            // Handle phase transitions based on tool results
+            this.handlePhaseTransitions(toolCall.name, result);
+            
             // Collect artifacts from worker results
             if (toolCall.name === 'delegate_to_worker' && result.success) {
               this.metrics.workerDelegations++;
@@ -439,7 +468,7 @@ export class OrionAgent extends DurableObject implements OrionRPC {
             return {
               response: askResult?.result.summary || 'Please provide more information.',
               artifacts,
-              conversationPhase: 'discovery',
+              conversationPhase: this.phaseManager.getCurrentPhase(),
               metadata: {
                 turnsUsed: turn,
                 toolsUsed: Array.from(toolsUsed),
@@ -447,9 +476,9 @@ export class OrionAgent extends DurableObject implements OrionRPC {
             };
           }
           
-          // Feed results back to admin
+          // Feed results back to admin (proper FunctionResponse format)
           const feedbackMessage = this.formatToolResults(toolResults);
-          messages.push({ role: 'user', content: feedbackMessage });
+          messages.push({ role: 'function', content: feedbackMessage });
           await this.saveMessage('user', feedbackMessage);
           
         } else {
@@ -457,7 +486,7 @@ export class OrionAgent extends DurableObject implements OrionRPC {
           return {
             response: response.text,
             artifacts,
-            conversationPhase: 'delivery',
+            conversationPhase: this.phaseManager.getCurrentPhase(),
             metadata: {
               turnsUsed: turn,
               toolsUsed: Array.from(toolsUsed),
@@ -472,7 +501,7 @@ export class OrionAgent extends DurableObject implements OrionRPC {
       return {
         response: finalMessage || 'Processing complete.',
         artifacts,
-        conversationPhase: 'execution',
+        conversationPhase: this.phaseManager.getCurrentPhase(),
         metadata: {
           turnsUsed: turn,
           toolsUsed: Array.from(toolsUsed),
@@ -484,12 +513,97 @@ export class OrionAgent extends DurableObject implements OrionRPC {
       return {
         response: `Error: ${error instanceof Error ? error.message : String(error)}`,
         artifacts,
-        conversationPhase: 'discovery',
+        conversationPhase: this.phaseManager.getCurrentPhase(),
         metadata: {
           turnsUsed: turn,
           toolsUsed: Array.from(toolsUsed),
         }
       };
+    }
+  }
+
+  // =============================================================
+  // Phase Management
+  // =============================================================
+
+  private buildPhaseAwareSystemPrompt(phase: ConversationPhase): string {
+    const basePrompt = this.adminSystemPrompt;
+    
+    const phaseGuidance: Record<ConversationPhase, string> = {
+      discovery: `
+CURRENT PHASE: DISCOVERY
+Focus on understanding user intent and gathering context.
+- Use web_search for quick lookups
+- Use rag_search to find similar past tasks
+- Use ask_user to clarify requirements
+- For simple tasks: delegate directly
+- For complex tasks: transition to planning with planned_tasks(new_task)
+`,
+      planning: `
+CURRENT PHASE: PLANNING
+Create structured task plans with clear steps.
+- Use rag_search(sources=['tasks']) to find similar task templates
+- Create todo.json with planned_tasks(new_task)
+- Break down into clear, delegatable steps
+- Assign appropriate worker types to each step
+- Once plan is ready: transition to execution
+`,
+      execution: `
+CURRENT PHASE: EXECUTION
+Execute task steps systematically via workers.
+- Load active task with planned_tasks(load_task)
+- Delegate current step with delegate_to_worker
+- Save artifacts with artifact_tool(write)
+- Update progress with planned_tasks(update_task)
+- After each step: transition to review if checkpoint
+- When all steps complete: transition to delivery
+`,
+      review: `
+CURRENT PHASE: REVIEW
+Validate step outputs and gather user feedback.
+- Present step results clearly
+- Use ask_user for validation if needed
+- If approved: transition back to execution for next step
+- If complete: transition to delivery
+`,
+      delivery: `
+CURRENT PHASE: DELIVERY
+Present final results and prepare for next task.
+- Summarize all outputs and artifacts
+- Highlight key achievements
+- Offer next steps
+- After delivery: transition to discovery for new tasks
+`
+    };
+    
+    return basePrompt + '\n\n' + phaseGuidance[phase];
+  }
+
+  private handlePhaseTransitions(toolName: string, result: ToolResult): void {
+    // Auto-transition based on tool usage
+    const currentPhase = this.phaseManager.getCurrentPhase();
+    
+    if (toolName === 'planned_tasks' && result.success) {
+      const action = result.metadata?.action || result.data?.action;
+      
+      if (action === 'new_task' && currentPhase === 'planning') {
+        this.phaseManager.transitionTo('execution', 'Task plan created');
+        this.phaseManager.setActiveTask(result.data.taskId, 1);
+        this.metrics.phaseTransitions++;
+      }
+      
+      if (action === 'update_task') {
+        const taskStatus = result.metadata?.taskStatus;
+        if (taskStatus === 'completed' && currentPhase === 'execution') {
+          this.phaseManager.transitionTo('delivery', 'All steps completed');
+          this.metrics.phaseTransitions++;
+        }
+      }
+    }
+    
+    if (toolName === 'delegate_to_worker' && result.success) {
+      // After worker delegation, move to review if checkpoint
+      // This would need step context to determine
     }
   }
 
@@ -500,19 +614,18 @@ export class OrionAgent extends DurableObject implements OrionRPC {
   private formatToolResults(
     toolResults: Array<{ name: string; result: ToolResult }>
   ): string {
-    const parts = ['<tool_results>'];
-    
-    for (const { name, result } of toolResults) {
-      parts.push(`\n<tool name="${name}" success="${result.success}">`);
-      parts.push(`<summary>${result.summary}</summary>`);
-      if (result.data && typeof result.data === 'object') {
-        parts.push(`<data>${JSON.stringify(result.data, null, 2)}</data>`);
+    // Format as proper FunctionResponse
+    const responses = toolResults.map(({ name, result }) => ({
+      name,
+      response: {
+        success: result.success,
+        data: result.data,
+        summary: result.summary,
+        metadata: result.metadata
       }
-      parts.push(`</tool>`);
-    }
+    }));
     
-    parts.push('\n</tool_results>');
-    return parts.join('');
+    return JSON.stringify({ functionResponses: responses }, null, 2);
   }
 
   private formatContextForGemini(
