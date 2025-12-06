@@ -1,4 +1,4 @@
-// src/durable-agent-v2.ts - Refactored Admin-Worker Architecture with Phase Management
+// src/durable-agent.ts - Complete Admin-Worker Architecture with B2 Workspace
 
 import { DurableObject } from 'cloudflare:workers';
 import type { DurableObjectState } from '@cloudflare/workers-types';
@@ -21,17 +21,26 @@ import { buildAdminSystemPrompt } from './prompts/admin-system-prompt';
 import { WorkerFactory } from './workers/specialized-workers';
 import { AdminToolRegistry } from './tools-v2/tool-registry';
 import { PhaseManager, type ConversationPhase } from './core/phase-manager';
-import type { ToolResult } from './tools-v2/tool-types';
 import { Workspace } from './workspace/workspace';
+import type { ToolResult } from './tools-v2/tool-types';
 
 /**
- * Refactored ORION Agent with Admin-Worker Architecture
+ * ORION Agent - Admin-Worker Architecture with B2 Workspace
  * 
  * Architecture:
  * - Admin Agent: Orchestration via function calling
- * - Worker Agents: Execution via native tools
+ * - Worker Agents: Execution via native tools (search, code execution)
  * - Phase Manager: Explicit conversation state machine
- * - Clear separation of concerns
+ * - B2 Workspace: Persistent task and artifact storage
+ * - D1 Database: Session and message persistence
+ * - Vectorize: Semantic memory for RAG
+ * 
+ * Key Features:
+ * - Multi-step task planning and execution
+ * - Checkpoint-based review workflow
+ * - Artifact lifecycle management
+ * - Cross-session task continuation
+ * - Autonomous tool selection and coordination
  */
 export class OrionAgent extends DurableObject implements OrionRPC {
   private state: DurableObjectState;
@@ -66,6 +75,7 @@ export class OrionAgent extends DurableObject implements OrionRPC {
     this.gemini = new GeminiClient({ apiKey: env.GEMINI_API_KEY });
     this.adminSystemPrompt = buildAdminSystemPrompt();
     
+    // Extract session ID from Durable Object name
     const name = state.id.name;
     if (name?.startsWith('session:')) {
       this.sessionId = name.slice(8);
@@ -81,13 +91,13 @@ export class OrionAgent extends DurableObject implements OrionRPC {
     
     console.log('[AgentV2] Starting initialization...');
     
-    // Initialize D1
+    // Step 1: Initialize D1 Database
     if (this.env.DB) {
       this.d1 = new D1Manager(this.env.DB);
       console.log('[AgentV2] ✅ D1 initialized');
     }
     
-    // Initialize Memory (Vectorize)
+    // Step 2: Initialize Memory (Vectorize) and Hydrate from D1
     if (this.sessionId) {
       if (this.env.VECTORIZE) {
         this.memory = new MemoryManager(
@@ -100,27 +110,19 @@ export class OrionAgent extends DurableObject implements OrionRPC {
         console.log('[AgentV2] ✅ Memory/Vectorize initialized');
       }
       
-      // Hydrate from D1
+      // Hydrate conversation history from D1 if empty
       if (this.d1 && this.storage.getMessages().length === 0) {
         await this.hydrateFromD1();
       }
 
-      // Schedule periodic D1 sync
+      // Schedule periodic D1 sync (every 5 minutes)
       await this.storage.setAlarm(Date.now() + 300000);
     }
     
-    // ===== CRITICAL: B2 Workspace Initialization =====
+    // Step 3: Initialize B2 Workspace (CRITICAL: Before tools)
     const workspaceConfigured = this.isWorkspaceConfigured();
     
-    if (!workspaceConfigured) {
-      console.warn('[AgentV2] ⚠️  B2 Workspace not configured');
-      console.warn('[AgentV2] Missing environment variables:');
-      console.warn(`  - B2_KEY_ID: ${this.env.B2_KEY_ID ? 'SET' : 'MISSING'}`);
-      console.warn(`  - B2_APPLICATION_KEY: ${this.env.B2_APPLICATION_KEY ? 'SET' : 'MISSING'}`);
-      console.warn(`  - B2_S3_ENDPOINT: ${this.env.B2_S3_ENDPOINT ? 'SET' : 'MISSING'}`);
-      console.warn(`  - B2_BUCKET: ${this.env.B2_BUCKET ? 'SET' : 'MISSING'}`);
-      this.workspaceEnabled = false;
-    } else {
+    if (workspaceConfigured) {
       try {
         console.log('[AgentV2] Initializing B2 Workspace...');
         console.log('[AgentV2] B2 Config:', {
@@ -131,41 +133,40 @@ export class OrionAgent extends DurableObject implements OrionRPC {
           basePath: this.env.B2_BASE_PATH || '(none)'
         });
         
+        // Initialize workspace singleton
         Workspace.initialize(this.env);
         
-        if (!Workspace.isInitialized()) {
-          throw new Error('Workspace.isInitialized() returned false after initialize()');
-        }
-        
-        const config = Workspace.getConfig();
-        console.log('[AgentV2] Workspace config:', {
-          endpoint: config.endpoint,
-          bucket: config.bucket,
-          basePath: config.basePath,
-          region: config.region
-        });
-        
-        try {
-          const tasksExists = await Workspace.exists('tasks');
-          if (!tasksExists) {
-            await Workspace.mkdir('tasks');
-            console.log('[AgentV2] Created tasks directory');
-          } else {
-            console.log('[AgentV2] Tasks directory exists');
-          }
-          
+        // Verify initialization succeeded
+        if (Workspace.isInitialized()) {
           this.workspaceEnabled = true;
-          console.log('[AgentV2] ✅ B2 Workspace initialized and verified');
+          console.log('[AgentV2] ✅ B2 Workspace initialized successfully');
           
-        } catch (testError) {
-          console.error('[AgentV2] ⚠️  Workspace test operation failed:', testError);
-          console.error('[AgentV2] Error details:', {
-            message: testError instanceof Error ? testError.message : String(testError),
-            stack: testError instanceof Error ? testError.stack : undefined
-          });
+          // Test workspace by ensuring tasks directory exists
+          try {
+            const config = Workspace.getConfig();
+            console.log('[AgentV2] Workspace config:', {
+              endpoint: config.endpoint,
+              bucket: config.bucket,
+              basePath: config.basePath
+            });
+            
+            // Create tasks directory if it doesn't exist
+            const tasksExists = await Workspace.exists('tasks');
+            if (!tasksExists) {
+              await Workspace.mkdir('tasks');
+              console.log('[AgentV2] Created tasks directory');
+            } else {
+              console.log('[AgentV2] Tasks directory already exists');
+            }
+          } catch (testError) {
+            console.error('[AgentV2] ⚠️  Workspace test failed:', testError);
+            // Don't throw - allow system to continue with workspace disabled
+            this.workspaceEnabled = false;
+          }
+        } else {
+          console.error('[AgentV2] ❌ Workspace.isInitialized() returned false');
           this.workspaceEnabled = false;
         }
-        
       } catch (error) {
         console.error('[AgentV2] ❌ B2 Workspace initialization failed:', error);
         console.error('[AgentV2] Error details:', {
@@ -174,9 +175,17 @@ export class OrionAgent extends DurableObject implements OrionRPC {
         });
         this.workspaceEnabled = false;
       }
+    } else {
+      console.warn('[AgentV2] ⚠️  B2 Workspace not configured');
+      console.warn('[AgentV2] Missing environment variables. Required:');
+      console.warn('  - B2_KEY_ID:', this.env.B2_KEY_ID ? 'SET' : 'MISSING');
+      console.warn('  - B2_APPLICATION_KEY:', this.env.B2_APPLICATION_KEY ? 'SET' : 'MISSING');
+      console.warn('  - B2_S3_ENDPOINT:', this.env.B2_S3_ENDPOINT ? 'SET' : 'MISSING');
+      console.warn('  - B2_BUCKET:', this.env.B2_BUCKET ? 'SET' : 'MISSING');
+      this.workspaceEnabled = false;
     }
     
-    // Initialize core components (AFTER workspace initialization)
+    // Step 4: Initialize Core Components (AFTER workspace)
     this.workerFactory = new WorkerFactory(this.gemini);
     this.toolRegistry = new AdminToolRegistry(
       this.gemini,
@@ -194,6 +203,9 @@ export class OrionAgent extends DurableObject implements OrionRPC {
     });
   }
 
+  /**
+   * Check if B2 workspace environment variables are configured
+   */
   private isWorkspaceConfigured(): boolean {
     return !!(
       this.env.B2_KEY_ID &&
@@ -203,10 +215,14 @@ export class OrionAgent extends DurableObject implements OrionRPC {
     );
   }
 
+  /**
+   * Hydrate state from D1 database
+   */
   private async hydrateFromD1(): Promise<void> {
     if (!this.d1 || !this.sessionId) return;
     
     try {
+      console.log('[AgentV2] Hydrating from D1...');
       const messages = await this.d1.loadMessages(this.sessionId, 50);
       
       if (messages.length > 0) {
@@ -217,10 +233,10 @@ export class OrionAgent extends DurableObject implements OrionRPC {
             msg.timestamp
           );
         }
-        console.log(`[AgentV2] Hydrated ${messages.length} messages from D1`);
+        console.log(`[AgentV2] ✅ Hydrated ${messages.length} messages from D1`);
       }
-    } catch (error) {
-      console.error('[AgentV2] Failed to hydrate from D1:', error);
+    } catch (err) {
+      console.error('[AgentV2] D1 hydration failed:', err);
     }
   }
 
@@ -237,6 +253,7 @@ export class OrionAgent extends DurableObject implements OrionRPC {
       console.error('[AgentV2] Alarm sync failed:', err);
     }
     
+    // Reschedule for 5 minutes from now
     await this.storage.setAlarm(Date.now() + 300000);
   }
 
@@ -258,6 +275,7 @@ export class OrionAgent extends DurableObject implements OrionRPC {
     
     const result = await this.executeAdminLoop(message, images);
     
+    // Sync to D1 in background (non-blocking)
     if (this.d1 && this.sessionId) {
       this.state.waitUntil(
         this.syncToD1().catch(err => {
@@ -347,6 +365,7 @@ export class OrionAgent extends DurableObject implements OrionRPC {
     } as StatusResponse;
   }
 
+  // Placeholder implementations for backward compatibility
   async executeStep(): Promise<any> {
     throw new Error('executeStep not implemented in v2 architecture');
   }
@@ -408,8 +427,13 @@ export class OrionAgent extends DurableObject implements OrionRPC {
     }
   }
 
-  async webSocketClose(): Promise<void> {}
-  async webSocketError(): Promise<void> {}
+  async webSocketClose(): Promise<void> {
+    console.log('[AgentV2] WebSocket closed');
+  }
+  
+  async webSocketError(ws: WebSocket, error: any): Promise<void> {
+    console.error('[AgentV2] WebSocket error:', error);
+  }
 
   private async handleWebSocketChat(
     ws: WebSocket,
@@ -473,18 +497,23 @@ export class OrionAgent extends DurableObject implements OrionRPC {
     const toolsUsed = new Set<string>();
     
     try {
+      // Save user message
       await this.saveMessage('user', userMessage);
       
+      // Get current phase context
       const currentPhase = this.phaseManager.getCurrentPhase();
       callbacks?.onStatus?.(`Phase: ${currentPhase}`);
       
+      // Build conversation context with phase awareness
       const systemPrompt = this.buildPhaseAwareSystemPrompt(currentPhase);
+      const recentMessages = this.storage.getMessages().slice(-10);
       const messages: Array<{ role: string; content: string }> = [
         { role: 'system', content: systemPrompt },
-        ...this.formatContextForGemini(this.storage.getMessages().slice(-10)),
+        ...this.formatContextForGemini(recentMessages),
         { role: 'user', content: userMessage }
       ];
       
+      // Admin loop with function calling
       while (turn < maxTurns) {
         turn++;
         this.metrics.adminTurns++;
@@ -513,6 +542,7 @@ export class OrionAgent extends DurableObject implements OrionRPC {
         messages.push({ role: 'assistant', content: response.text });
         await this.saveMessage('model', response.text);
         
+        // Process function calls
         if (response.toolCalls && response.toolCalls.length > 0) {
           const toolResults: Array<{ name: string; result: ToolResult }> = [];
           let userInputRequired = false;
@@ -529,8 +559,10 @@ export class OrionAgent extends DurableObject implements OrionRPC {
             
             toolResults.push({ name: toolCall.name, result });
             
+            // Handle phase transitions based on tool results
             this.handlePhaseTransitions(toolCall.name, result);
             
+            // Collect artifacts from worker results
             if (toolCall.name === 'delegate_to_worker' && result.success) {
               this.metrics.workerDelegations++;
               const workerResult = result.data;
@@ -540,11 +572,13 @@ export class OrionAgent extends DurableObject implements OrionRPC {
               }
             }
             
+            // Check if user input required
             if (this.toolRegistry.isUserInputRequired(toolCall.name, result)) {
               userInputRequired = true;
             }
           }
           
+          // If ask_user was called, return immediately
           if (userInputRequired) {
             const askResult = toolResults.find(r => r.name === 'ask_user');
             return {
@@ -558,11 +592,13 @@ export class OrionAgent extends DurableObject implements OrionRPC {
             };
           }
           
+          // Feed results back to admin
           const feedbackMessage = this.formatToolResults(toolResults);
           messages.push({ role: 'function', content: feedbackMessage });
           await this.saveMessage('user', feedbackMessage);
           
         } else {
+          // Admin provided final response (no more tool calls)
           return {
             response: response.text,
             artifacts,
@@ -576,6 +612,7 @@ export class OrionAgent extends DurableObject implements OrionRPC {
         }
       }
       
+      // Max turns reached
       const finalMessage = messages[messages.length - 1].content;
       return {
         response: finalMessage || 'Processing complete.',
