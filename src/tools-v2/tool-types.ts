@@ -1,4 +1,4 @@
-//  - Admin Tool Type Definitions
+// src/tools-v2/tool-types.ts - Enhanced Tool Type Definitions
 
 /**
  * Generic tool result with structured data and summary
@@ -12,6 +12,7 @@ export interface ToolResult<T = any> {
     confidence?: number;
     cacheHit?: boolean;
     tokensUsed?: number;
+    requiresUserInput?: boolean;
     [key: string]: any;
   };
 }
@@ -58,36 +59,83 @@ export interface MemoryResult {
 }
 
 /**
- * Task document structure
+ * RAG search result structure
  */
-export interface TaskDocument {
-  id: string;
-  objective: string;
-  status: 'planning' | 'in_progress' | 'completed' | 'failed';
-  workflowId?: string;
-  conversationSummary: string;
+export interface RAGResult {
+  memory: MemoryResult[];
+  files: FileSearchResult[];
+  artifacts: ArtifactSearchResult[];
+  tasks: TaskSearchResult[];
+}
+
+export interface FileSearchResult {
+  fileName: string;
+  fileUri: string;
+  snippet: string;
+  relevance: number;
+}
+
+export interface ArtifactSearchResult {
+  artifactId: string;
+  taskId: string;
+  title: string;
+  type: string;
+  snippet: string;
+  relevance: number;
+}
+
+export interface TaskSearchResult {
+  taskId: string;
+  title: string;
+  description: string;
+  status: string;
+  relevance: number;
   createdAt: number;
-  updatedAt: number;
-  steps: TaskStep[];
 }
 
 /**
- * Individual task step
+ * Task management structures
  */
-export interface TaskStep {
-  stepNumber: number;
-  workerType: 'research' | 'code' | 'analysis' | 'content';
+export interface TodoStructure {
+  taskId: string;
+  title: string;
+  description: string;
   status: 'pending' | 'in_progress' | 'completed' | 'failed';
-  input: {
-    objective: string;
-    constraints: string[];
+  steps: TodoStep[];
+  metadata: {
+    createdAt: number;
+    updatedAt: number;
+    createdBy?: string;
+    tags?: string[];
   };
-  output?: {
-    success: boolean;
-    result: string;
-    artifacts: string[];
-    turnsUsed: number;
-  };
+}
+
+export interface TodoStep {
+  number: number;
+  title: string;
+  description: string;
+  workerType: 'research' | 'code' | 'analysis' | 'content';
+  objective: string;
+  requirements: string[];
+  dependencies?: Array<{ stepNumber: number; outputPath: string }>;
+  outputs: string[];
+  checkpoint: boolean;
+  status: 'pending' | 'in_progress' | 'completed' | 'skipped' | 'failed';
   startedAt?: number;
   completedAt?: number;
+  turnsUsed?: number;
+  notes?: string;
+}
+
+/**
+ * Artifact management types
+ */
+export interface ArtifactReference {
+  artifactId: string;
+  taskId: string;
+  stepNumber: number;
+  path: string;
+  type: string;
+  title: string;
+  createdAt: number;
 }
