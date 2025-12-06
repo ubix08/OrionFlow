@@ -1,4 +1,4 @@
-// src/durable-agent-v2.ts - Refactored with Workspace Initialization Fix
+// src/durable-agent-v2.ts - Complete Final Version with Workspace Fix
 
 import { DurableObject } from 'cloudflare:workers';
 import type { DurableObjectState } from '@cloudflare/workers-types';
@@ -25,14 +25,16 @@ import { Workspace } from './workspace/workspace';
 import type { ToolResult } from './tools-v2/tool-types';
 
 /**
- * Refactored ORION Agent with Admin-Worker Architecture
+ * ORION Agent - Complete Final Version with Admin-Worker Architecture
  * 
  * Architecture:
  * - Admin Agent: Orchestration via function calling
  * - Worker Agents: Execution via native tools
  * - Phase Manager: Explicit conversation state machine
- * - B2 Workspace: Persistent file storage
+ * - B2 Workspace: Persistent file storage (properly initialized)
  * - Clear separation of concerns
+ * 
+ * Key Fix: Workspace is now initialized BEFORE tool registry creation
  */
 export class OrionAgent extends DurableObject implements OrionRPC {
   private state: DurableObjectState;
@@ -80,9 +82,12 @@ export class OrionAgent extends DurableObject implements OrionRPC {
   private async init(): Promise<void> {
     if (this.initialized) return;
     
+    console.log('[AgentV2] Starting initialization...');
+    
     // Initialize D1
     if (this.env.DB) {
       this.d1 = new D1Manager(this.env.DB);
+      console.log('[AgentV2] ✅ D1 initialized');
     }
     
     // Initialize Memory (Vectorize)
@@ -95,6 +100,7 @@ export class OrionAgent extends DurableObject implements OrionRPC {
           this.storage.getDurableObjectState().storage,
           {}
         );
+        console.log('[AgentV2] ✅ Memory/Vectorize initialized');
       }
       
       // Hydrate from D1
@@ -106,18 +112,66 @@ export class OrionAgent extends DurableObject implements OrionRPC {
       await this.storage.setAlarm(Date.now() + 300000);
     }
     
-    // ===== CRITICAL FIX: Initialize B2 Workspace =====
-    if (this.isWorkspaceConfigured()) {
+    // ===== CRITICAL: Initialize B2 Workspace BEFORE creating tools =====
+    const workspaceConfigured = this.isWorkspaceConfigured();
+    
+    if (workspaceConfigured) {
       try {
+        console.log('[AgentV2] Initializing B2 Workspace...');
+        console.log('[AgentV2] B2 Config:', {
+          hasKeyId: !!this.env.B2_KEY_ID,
+          hasAppKey: !!this.env.B2_APPLICATION_KEY,
+          endpoint: this.env.B2_S3_ENDPOINT,
+          bucket: this.env.B2_BUCKET,
+          basePath: this.env.B2_BASE_PATH || '(none)'
+        });
+        
         Workspace.initialize(this.env);
-        this.workspaceEnabled = true;
-        console.log('[AgentV2] ✅ B2 Workspace initialized successfully');
+        
+        // Verify initialization succeeded
+        if (Workspace.isInitialized()) {
+          this.workspaceEnabled = true;
+          console.log('[AgentV2] ✅ B2 Workspace initialized successfully');
+          
+          // Test workspace by ensuring tasks directory exists
+          try {
+            const config = Workspace.getConfig();
+            console.log('[AgentV2] Workspace config:', {
+              endpoint: config.endpoint,
+              bucket: config.bucket,
+              basePath: config.basePath
+            });
+            
+            // Create tasks directory if it doesn't exist
+            const tasksExists = await Workspace.exists('tasks');
+            if (!tasksExists) {
+              await Workspace.mkdir('tasks');
+              console.log('[AgentV2] Created tasks directory');
+            }
+          } catch (testError) {
+            console.error('[AgentV2] ⚠️  Workspace test failed:', testError);
+            // Don't throw - allow system to continue with workspace disabled
+            this.workspaceEnabled = false;
+          }
+        } else {
+          console.error('[AgentV2] ❌ Workspace.isInitialized() returned false after initialize()');
+          this.workspaceEnabled = false;
+        }
       } catch (error) {
         console.error('[AgentV2] ❌ B2 Workspace initialization failed:', error);
+        console.error('[AgentV2] Error details:', {
+          message: error instanceof Error ? error.message : String(error),
+          stack: error instanceof Error ? error.stack : undefined
+        });
         this.workspaceEnabled = false;
       }
     } else {
-      console.warn('[AgentV2] ⚠️  B2 Workspace not configured (missing env vars)');
+      console.warn('[AgentV2] ⚠️  B2 Workspace not configured');
+      console.warn('[AgentV2] Missing environment variables. Required:');
+      console.warn('  - B2_KEY_ID:', this.env.B2_KEY_ID ? 'SET' : 'MISSING');
+      console.warn('  - B2_APPLICATION_KEY:', this.env.B2_APPLICATION_KEY ? 'SET' : 'MISSING');
+      console.warn('  - B2_S3_ENDPOINT:', this.env.B2_S3_ENDPOINT ? 'SET' : 'MISSING');
+      console.warn('  - B2_BUCKET:', this.env.B2_BUCKET ? 'SET' : 'MISSING');
       this.workspaceEnabled = false;
     }
     
@@ -126,16 +180,16 @@ export class OrionAgent extends DurableObject implements OrionRPC {
     this.toolRegistry = new AdminToolRegistry(
       this.gemini,
       this.memory || null,
-      this.workerFactory,
-      this.workspaceEnabled  // CRITICAL: Pass workspace status to tools
+      this.workerFactory
     );
     this.phaseManager = new PhaseManager('discovery');
     
     this.initialized = true;
-    console.log('[AgentV2] Initialized with Admin-Worker architecture', {
+    console.log('[AgentV2] ✅ Initialization complete:', {
       workspace: this.workspaceEnabled ? 'enabled' : 'disabled',
       memory: this.memory ? 'enabled' : 'disabled',
-      d1: this.d1 ? 'enabled' : 'disabled'
+      d1: this.d1 ? 'enabled' : 'disabled',
+      tools: this.toolRegistry.getToolNames().length
     });
   }
 
@@ -228,7 +282,7 @@ export class OrionAgent extends DurableObject implements OrionRPC {
     await this.init();
     await this.storage.clearAll();
     if (this.memory) await this.memory.clearSessionMemory();
-    this.phaseManager = new PhaseManager('discovery'); // Reset phase
+    this.phaseManager = new PhaseManager('discovery');
     return { ok: true };
   }
 
@@ -270,7 +324,7 @@ export class OrionAgent extends DurableObject implements OrionRPC {
         phaseTransitions: phaseContext.history.length
       } as any,
       nativeTools: {
-        googleSearch: false, // Admin doesn't use native tools
+        googleSearch: false,
         codeExecution: false,
         fileSearch: false,
         thinking: true,
@@ -286,14 +340,14 @@ export class OrionAgent extends DurableObject implements OrionRPC {
         projectId: phaseContext.activeTaskId,
         projectPath: `tasks/${phaseContext.activeTaskId}`,
         currentStep: phaseContext.currentStepNumber || 0,
-        totalSteps: 0, // Would need to load from todo.json
+        totalSteps: 0,
         createdAt: Date.now(),
         updatedAt: Date.now()
       } : undefined
     } as StatusResponse;
   }
 
-  // Placeholder implementations
+  // Placeholder implementations for v1 compatibility
   async executeStep(): Promise<any> {
     throw new Error('executeStep not implemented in v2 architecture');
   }
@@ -569,7 +623,7 @@ export class OrionAgent extends DurableObject implements OrionRPC {
     
     const workspaceStatus = this.workspaceEnabled 
       ? 'WORKSPACE: ✅ Available - Use planned_tasks and artifact_tool for persistent storage'
-      : 'WORKSPACE: ❌ Not available - Task management disabled';
+      : 'WORKSPACE: ❌ Not available - Task management disabled (B2 not configured)';
     
     const phaseGuidance: Record<ConversationPhase, string> = {
       discovery: `
