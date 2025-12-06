@@ -1,4 +1,4 @@
-// src/index-v2.ts - Worker Entry Point (Fixed)
+// src/index.ts - Worker Entry Point
 
 import { OrionAgent } from './durable-agent';
 import { D1Manager } from './storage/d1-manager';
@@ -35,7 +35,7 @@ function isValidSessionId(sessionId: string): boolean {
 }
 
 // =============================================================
-// RPC Routing (Fixed for AGENT_V2)
+// RPC Routing
 // =============================================================
 
 async function routeToRPC(
@@ -54,8 +54,7 @@ async function routeToRPC(
   }
 
   try {
-    // ✅ FIXED: Use AGENT instead of AGENT_V2
-    // The Durable Object binding name in wrangler.toml is 'AGENT'
+    // Get Durable Object stub
     const id = env.AGENT.idFromName(`session:${sessionId}`);
     const stub = env.AGENT.get(id) as DurableObjectStub<OrionRPC>;
 
@@ -147,7 +146,7 @@ async function routeToRPC(
 }
 
 // =============================================================
-// WebSocket Routing (Fixed)
+// WebSocket Routing
 // =============================================================
 
 async function routeToWebSocket(
@@ -162,7 +161,6 @@ async function routeToWebSocket(
   }
 
   try {
-    // ✅ FIXED: Use AGENT binding
     const id = env.AGENT.idFromName(`session:${sessionId}`);
     const stub = env.AGENT.get(id);
 
@@ -226,12 +224,18 @@ export default {
             env.B2_S3_ENDPOINT &&
             env.B2_BUCKET
           ),
-          details: {
+          validation: {
             hasKeyId: !!env.B2_KEY_ID,
             hasAppKey: !!env.B2_APPLICATION_KEY,
             hasEndpoint: !!env.B2_S3_ENDPOINT,
             hasBucket: !!env.B2_BUCKET,
-            hasBasePath: !!env.B2_BASE_PATH
+            hasBasePath: !!env.B2_BASE_PATH,
+            endpointFormat: env.B2_S3_ENDPOINT ? 
+              (String(env.B2_S3_ENDPOINT).startsWith('http') ? 'valid' : 'invalid (missing protocol)') : 
+              'missing',
+            endpointValue: env.B2_S3_ENDPOINT ? 
+              String(env.B2_S3_ENDPOINT) : 
+              'not set'
           }
         };
 
@@ -239,7 +243,7 @@ export default {
           status: 'ok',
           name: 'ORION AI-Collaborator',
           version: '2.1.0',
-          architecture: 'Admin-Worker v2',
+          architecture: 'Admin-Worker v2 with B2 Workspace',
           d1: d1Status,
           workspace: b2Status,
           timestamp: new Date().toISOString()
