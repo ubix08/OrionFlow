@@ -1,18 +1,24 @@
-// src/types.ts - Enhanced Type Definitions (Session-Agnostic)
+// src/types.ts - Enhanced Type Definitions (Fixed Environment)
 
 import type { DurableObjectNamespace, D1Database, VectorizeIndex } from '@cloudflare/workers-types';
 
 // =============================================================
-// Environment
+// Environment (✅ FIXED)
 // =============================================================
 
 export interface Env {
+  // Durable Object Namespace
   AGENT: DurableObjectNamespace;
+  
+  // Databases
   DB?: D1Database;
   VECTORIZE?: VectorizeIndex;
+  
+  // API Keys
   GEMINI_API_KEY: string;
   JWT_SECRET?: string;
   
+  // B2 Workspace Configuration
   B2_KEY_ID?: string;
   B2_APPLICATION_KEY?: string;
   B2_S3_ENDPOINT?: string;
@@ -43,7 +49,7 @@ export interface Session {
 }
 
 // =============================================================
-// Project System (Session-Agnostic)
+// Project System
 // =============================================================
 
 export interface ProjectMetadata {
@@ -51,25 +57,21 @@ export interface ProjectMetadata {
   createdBy: string;
   createdAt: number;
   updatedAt: number;
-  version: number; // For optimistic locking
+  version: number;
   
-  // Discovery
   title: string;
   objective: string;
   domain: string;
   tags: string[];
   
-  // State
   status: 'planning' | 'active' | 'paused' | 'completed' | 'failed';
   currentStep: number;
   totalSteps: number;
   
-  // Provenance
   workflowId?: string;
   lastCheckpoint?: number;
   checkpointData?: any;
   
-  // Sessions
   sessions: ProjectSession[];
 }
 
@@ -100,30 +102,8 @@ export interface Intent {
   type: 'simple' | 'complex' | 'project_continuation' | 'project_query';
   projectId?: string;
   reasoning: string;
-  complexity: number; // 1-10
-  confidence: number; // 0-1
-}
-
-// =============================================================
-// Admin State
-// =============================================================
-
-export interface AdminState {
-  mode: 'conversational' | 'awaiting_plan_approval' | 'executing' | 'checkpoint_review';
-  
-  // Planning
-  pendingPlan?: WorkflowPlan;
-  pendingPlanId?: string;
-  
-  // Execution
-  activeProjectId?: string;
-  
-  // Checkpoint
-  checkpointData?: {
-    projectId: string;
-    stepNumber: number;
-    results: any;
-  };
+  complexity: number;
+  confidence: number;
 }
 
 // =============================================================
@@ -250,19 +230,15 @@ export interface MessagePart {
 export interface OrionRPC {
   chat(message: string, images?: Array<{ data: string; mimeType: string }>): Promise<ChatResponse>;
   
-  // Project Management
   listProjects(filters?: ProjectFilters): Promise<{ projects: ProjectMetadata[] }>;
   getProject(projectId: string): Promise<{ project: ProjectMetadata }>;
   continueProject(projectId: string): Promise<ChatResponse>;
   
-  // Session Management
   getHistory(): Promise<{ messages: Message[] }>;
   clear(): Promise<{ ok: boolean }>;
   
-  // Status
   getStatus(): Promise<StatusResponse>;
   
-  // Files
   uploadFile(base64: string, mimeType: string, name: string): Promise<{ success: boolean; file: FileMetadata }>;
   listFiles(): Promise<{ files: FileMetadata[] }>;
   deleteFile(fileUri: string): Promise<{ ok: boolean }>;
@@ -278,7 +254,7 @@ export interface ProjectFilters {
 export interface ChatResponse {
   response: string;
   artifacts: Artifact[];
-  conversationPhase: 'discovery' | 'execution' | 'delivery';
+  conversationPhase: 'discovery' | 'planning' | 'execution' | 'review' | 'delivery';
   suggestedWorkflows?: WorkflowTemplate[];
   activeProject?: ActiveProject;
   metadata?: {
@@ -302,14 +278,22 @@ export interface StatusResponse {
   sessionId?: string;
   userId?: string;
   messageCount: number;
-  conversationPhase: 'discovery' | 'execution' | 'delivery';
+  artifactCount: number;
+  conversationPhase: 'discovery' | 'planning' | 'execution' | 'review' | 'delivery';
   activeProject?: ActiveProject;
   protocol: string;
   metrics: AgentMetrics;
+  nativeTools: {
+    googleSearch: boolean;
+    codeExecution: boolean;
+    fileSearch: boolean;
+    thinking: boolean;
+  };
+  memory: any;
   workspace: WorkspaceStatus;
   availableWorkflows: number;
-  recentProjects: ProjectMetadata[];
-  unfinishedProjects: ProjectMetadata[];
+  recentProjects?: ProjectMetadata[];
+  unfinishedProjects?: ProjectMetadata[];
 }
 
 export interface WorkspaceStatus {
@@ -320,13 +304,18 @@ export interface WorkspaceStatus {
 
 export interface AgentMetrics {
   totalRequests: number;
-  simpleRequests: number;
-  complexRequests: number;
-  projectsCreated: number;
-  projectsResumed: number;
-  stepsCompleted: number;
-  checkpointsReached: number;
-  planRegenerations: number;
+  simpleRequests?: number;
+  complexRequests?: number;
+  projectsCreated?: number;
+  projectsResumed?: number;
+  stepsCompleted?: number;
+  checkpointsReached?: number;
+  planRegenerations?: number;
+  adminTurns?: number;
+  workerDelegations?: number;
+  toolCalls?: number;
+  totalTokens?: number;
+  phaseTransitions?: number;
 }
 
 // =============================================================
@@ -360,7 +349,7 @@ export interface FileMetadata {
 }
 
 // =============================================================
-// Agent State (Legacy - for Durable Storage)
+// Agent State
 // =============================================================
 
 export interface AgentState {
@@ -409,6 +398,8 @@ export type WSOutgoingMessage =
   | { type: 'step_started'; stepNumber: number; stepTitle: string }
   | { type: 'step_complete'; stepNumber: number; stepTitle: string; outputs: string[]; nextStepReady: boolean }
   | { type: 'project_created'; projectId: string; projectPath: string }
-  | { type: 'complete'; response: string; artifacts: Artifact[] }
+  | { type: 'artifact'; artifact: Artifact }
+  | { type: 'tool_use'; tool: string; params: any }
+  | { type: 'complete'; response: string; artifacts: Artifact[]; metadata?: any }
   | { type: 'error'; error: string }
   | { type: 'pong' };
